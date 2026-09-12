@@ -633,7 +633,17 @@ void main() {
       final String prompt = systemTurn();
       expect(prompt, contains('```task_action'));
       expect(prompt, contains('"recurrence": "none|daily|weekly"'));
-      expect(prompt, contains('Today is 2026-09-09'));
+
+      // The reference date carries the weekday too, so the model can resolve
+      // "next Sunday" rather than guessing at it.
+      expect(prompt, contains('Today is Wednesday, 2026-09-09'));
+      expect(prompt, contains('"tomorrow" is 2026-09-10'));
+
+      // A rule stated as a requirement, plus one worked example — models
+      // drop an optional-sounding format far more often than a mandatory one.
+      expect(prompt, contains('MUST append exactly one block'));
+      expect(prompt, contains('Worked example'));
+      expect(prompt, contains('"title": "Call the bank"'));
     });
 
     testWidgets('a proposed task is offered as a card, not as raw JSON', (
@@ -790,6 +800,87 @@ void main() {
       expect(find.text('قراءة'), findsOneWidget);
       expect(find.textContaining('إضافة المهمة إلى الجدول'), findsOneWidget);
       expect(systemTurn(), contains('```task_action'));
+    });
+  });
+
+  group('Parser resilience', () {
+    test('a json-tagged block is accepted too', () {
+      // What models send when they ignore the tag they were given.
+      final CoachReply reply = CoachReply.parse(
+        'Added it.\n\n```json\n{"title": "Call the bank", '
+        '"date": "2026-09-11", "time": "10:00"}\n```',
+        now: kDay,
+      );
+
+      expect(reply.text, 'Added it.');
+      expect(reply.action!.title, 'Call the bank');
+      expect(reply.action!.scheduledTime, DateTime(2026, 9, 11, 10, 0));
+    });
+
+    test('an untagged fence holding a task is accepted', () {
+      final CoachReply reply = CoachReply.parse(
+        'Done.\n\n```\n{"title": "Stretch", "date": "2026-09-11", '
+        '"time": "07:00", "recurrence": "daily"}\n```',
+        now: kDay,
+      );
+
+      expect(reply.text, 'Done.');
+      expect(reply.action!.title, 'Stretch');
+      expect(reply.action!.recurrenceType, RecurrenceType.daily);
+    });
+
+    test('an unrelated code block is left exactly where it is', () {
+      // Loose matching must not eat a code sample the user asked for.
+      const String withCode = 'Here is the shape:\n\n'
+          '```json\n{"status": "pending", "count": 2}\n```';
+      final CoachReply reply = CoachReply.parse(withCode, now: kDay);
+
+      expect(reply.text, withCode, reason: 'not a task, so not a block');
+      expect(reply.hasAction, isFalse);
+    });
+
+    test('a json block with a title but no usable task is left alone', () {
+      const String source = 'Example:\n\n```json\n{"title": ""}\n```';
+      final CoachReply reply = CoachReply.parse(source, now: kDay);
+
+      expect(reply.text, source);
+      expect(reply.hasAction, isFalse);
+    });
+
+    test('the tagged block wins when both are present', () {
+      final CoachReply reply = CoachReply.parse(
+        'Reference:\n```json\n{"title": "Wrong one"}\n```\n'
+        '```task_action\n{"title": "Right one", "date": "2026-09-11", '
+        '"time": "09:00"}\n```',
+        now: kDay,
+      );
+
+      expect(reply.action!.title, 'Right one');
+    });
+
+    test('a reply that promised scheduling and sent no block is flagged', () {
+      // Not recovered from — just detectable, so it can be logged rather
+      // than turning into a task the user never confirmed.
+      final CoachReply forgot = CoachReply.parse(
+        "Sure, I'll schedule the gym for tomorrow at six.",
+        now: kDay,
+      );
+      expect(forgot.hasAction, isFalse);
+      expect(forgot.promisedScheduling, isTrue);
+
+      final CoachReply arabic = CoachReply.parse(
+        'حسنًا، أضفت المهمة إلى جدولك.',
+        now: kDay,
+      );
+      expect(arabic.promisedScheduling, isTrue);
+    });
+
+    test('ordinary coaching talk is not mistaken for a promise', () {
+      final CoachReply reply = CoachReply.parse(
+        'You skipped the gym twice. What got in the way?',
+        now: kDay,
+      );
+      expect(reply.promisedScheduling, isFalse);
     });
   });
 }

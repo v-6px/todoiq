@@ -268,17 +268,33 @@ void main() {
       expect(prompt, contains('14:00'));
     });
 
-    test('asks for bottlenecks behind partial tasks and exactly two tips', () {
+    test('asks for obstacles behind partial tasks and concrete next steps',
+        () {
       final String prompt = ReportScreen.buildDebriefPrompt(
         ReportRange.today,
         sample(),
         kNow,
       );
 
-      expect(prompt, contains('## Bottlenecks'));
+      expect(prompt, contains('## Obstacles'));
       expect(prompt, contains('PARTIAL tasks specifically'));
-      expect(prompt, contains('## Two things to try'));
-      expect(prompt, contains('Exactly two'));
+      expect(prompt, contains('## Tomorrow\u2019s steps'));
+      expect(prompt, contains('tied to a task above'));
+    });
+
+    test('insists on a finished debrief rather than a truncated one', () {
+      // Running out of room is the failure users actually see: the report
+      // stops mid-sentence. Both turns of the prompt have to rule it out.
+      final String system = ReportScreen.systemPrompt(AppStrings.en);
+      expect(system, contains('never stop mid-sentence'));
+      expect(system, contains('250-400 words'));
+
+      final String prompt = ReportScreen.buildDebriefPrompt(
+        ReportRange.today,
+        sample(),
+        kNow,
+      );
+      expect(prompt, contains('Write all three sections'));
     });
 
     test('marks an absent status as none rather than omitting it', () {
@@ -347,6 +363,82 @@ void main() {
   });
 
   // ---- Screen behaviour -------------------------------------------------
+
+  group('Long debriefs', () {
+    /// A debrief far taller than the 600px test surface.
+    String longMarkdown() {
+      final StringBuffer buffer = StringBuffer('## Summary\n');
+      for (int i = 1; i <= 40; i++) {
+        buffer.writeln('Paragraph $i of the debrief, with enough words in it '
+            'to wrap onto more than one line on a phone.');
+        buffer.writeln();
+      }
+      buffer.writeln('## Tomorrow’s steps');
+      buffer.writeln('FINAL LINE OF THE DEBRIEF.');
+      return buffer.toString();
+    }
+
+    testWidgets('every part of a long debrief is rendered, not clipped', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: longMarkdown(),
+        )),
+      );
+
+      await pumpReport(tester);
+
+      // Built, even though it starts far below the fold.
+      expect(find.textContaining('FINAL LINE OF THE DEBRIEF.'), findsOneWidget);
+      expect(find.textContaining('Paragraph 40'), findsOneWidget);
+    });
+
+    testWidgets('the end of a long debrief can be scrolled to', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: longMarkdown(),
+        )),
+      );
+
+      await pumpReport(tester);
+
+      final Finder last = find.textContaining('FINAL LINE OF THE DEBRIEF.');
+      await tester.scrollUntilVisible(last, 300, scrollable: find.byType(Scrollable).first);
+      await tester.pumpAndSettle();
+
+      // On screen, and inside the viewport rather than painted past its edge.
+      final Rect box = tester.getRect(last);
+      final Size screen = tester.view.physicalSize / tester.view.devicePixelRatio;
+      expect(box.top, greaterThanOrEqualTo(0));
+      expect(box.bottom, lessThanOrEqualTo(screen.height));
+    });
+
+    testWidgets('the debrief asks for a budget that fits a full report', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await pumpReport(tester, client: replyWith('## Summary\nDone.'));
+
+      await tester.tap(find.byKey(ReportScreen.generateKey));
+      await settle(tester);
+
+      // 700 tokens used to cut an Arabic debrief off mid-sentence; Arabic
+      // costs markedly more tokens per word than English.
+      final Map<String, Object?> body =
+          jsonDecode(requests.single.body) as Map<String, Object?>;
+      expect(body['max_tokens'], AiService.debriefMaxTokens);
+      expect(AiService.debriefMaxTokens, greaterThanOrEqualTo(1500));
+    });
+  });
 
   group('Stat chip rendering', () {
     /// Every Text inside one chip, in the order they are laid out.
@@ -969,11 +1061,11 @@ void main() {
         strings: AppStrings.ar,
       );
 
-      expect(prompt, contains('## الملخّص'));
-      expect(prompt, contains('## العوائق'));
-      expect(prompt, contains('## أمران جرّبهما'));
+      expect(prompt, contains('## الملخص'));
+      expect(prompt, contains('## المعوقات'));
+      expect(prompt, contains('## خطوات الغد'));
       expect(prompt, isNot(contains('## Summary')));
-      expect(prompt, isNot(contains('## Bottlenecks')));
+      expect(prompt, isNot(contains('## Obstacles')));
     });
 
     test('the English prompt keeps the English headings', () {
@@ -984,8 +1076,8 @@ void main() {
       );
 
       expect(prompt, contains('## Summary'));
-      expect(prompt, contains('## Bottlenecks'));
-      expect(prompt, contains('## Two things to try'));
+      expect(prompt, contains('## Obstacles'));
+      expect(prompt, contains('## Tomorrow\u2019s steps'));
     });
   });
 }

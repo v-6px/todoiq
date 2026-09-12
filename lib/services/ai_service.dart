@@ -50,6 +50,20 @@ class AiException implements Exception {
 class AiService {
   static const Duration defaultTimeout = Duration(seconds: 60);
   static const Duration pingTimeout = Duration(seconds: 20);
+
+  /// Reply budget for a debrief.
+  ///
+  /// A debrief is several sections long, and a model that runs out of budget
+  /// stops mid-sentence rather than wrapping up — which reads as a bug. The
+  /// ceiling is deliberately far above what the prompt asks for, because the
+  /// prompt is what should decide the length; this only stops a runaway.
+  /// Arabic also costs noticeably more tokens per word than English, so the
+  /// same prompt needs more headroom in one language than the other.
+  static const int debriefMaxTokens = 2048;
+
+  /// Reply budget for one coach turn, which is a couple of paragraphs plus a
+  /// possible task_action block.
+  static const int coachMaxTokens = 1024;
   static const String userAgent = 'TaskMaster/1.0 (Flutter)';
 
   final http.Client _client;

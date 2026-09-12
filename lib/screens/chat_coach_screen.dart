@@ -94,19 +94,38 @@ class ChatCoachScreen extends StatefulWidget {
   /// in ASCII keys and ISO dates even when the reply itself is Arabic.
   static String taskActionInstructions(DateTime day) {
     final String today = DateFormat('yyyy-MM-dd').format(day);
+    final String weekday = DateFormat('EEEE', 'en').format(day);
+    final String tomorrow = DateFormat('yyyy-MM-dd')
+        .format(day.add(const Duration(days: 1)));
+
     return '''
-When they ask you to schedule, add or remind them of a task, finish your
-reply with exactly one block in this form, on its own lines after your
-normal text:
+TASK SCHEDULING — this is a hard requirement, not a suggestion.
+
+Whenever the user asks you to add, schedule, remind them of, or put something
+in their day, you MUST append exactly one block at the very end of your
+reply, after your normal text:
 ```task_action
 {"title": "...", "date": "YYYY-MM-DD", "time": "HH:mm", "recurrence": "none|daily|weekly", "days": [1,2,3]}
 ```
-Today is $today. Use 24-hour time. Include "days" only for '''
-        '"weekly", listing weekdays 1 (Monday) to 7 (Sunday). Keep the keys, '
-        'the date and the time in exactly this format even when you are '
-        'writing in another language — only "title" is translated. Add the '
-        'block only when they actually asked for something to be scheduled, '
-        'one block at most, and never mention or explain the block itself.';
+
+Worked example. If they say "remind me to call the bank tomorrow at 10",
+you reply with a sentence or two and then:
+```task_action
+{"title": "Call the bank", "date": "$tomorrow", "time": "10:00", "recurrence": "none"}
+```
+
+Dates. Today is $weekday, $today, so "tomorrow" is $tomorrow. Work every
+relative date out from that reference: "next Sunday" is the Sunday after
+today, "in three days" is today plus three. Never guess a date, and never
+write one in the past.
+
+Rules. Use 24-hour time. Include "days" only when "recurrence" is "weekly",
+listing weekdays as 1 (Monday) through 7 (Sunday). The keys, the date and the
+time stay in exactly this ASCII form even when you are writing in Arabic —
+only "title" is in the user's language. One block at most, always last, and
+never mention, explain or apologise for the block itself: the app strips it
+out and shows the user a confirmation card instead. If they are only talking
+about a task rather than asking for it to be scheduled, add no block.''';
   }
 
   static String _statusWord(String status) {
@@ -200,7 +219,7 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
             if (message.isSendable)
               AiMessage(role: message.role, content: message.content),
         ],
-        maxTokens: 600,
+        maxTokens: AiService.coachMaxTokens,
         temperature: 0.8,
       );
 
@@ -208,6 +227,16 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
       // The block is stripped before the text is stored, so the raw JSON is
       // never rendered and never echoed back into the next turn's history.
       final CoachReply parsed = CoachReply.parse(reply, now: _day);
+
+      // A model that talked about scheduling and then shipped no block is a
+      // prompt problem, not a user error — and it is invisible from the
+      // screen, so it goes to the log where it can be found. Deliberately not
+      // recovered from: a task the user never confirmed is worse than one
+      // they have to ask for twice.
+      if (!parsed.hasAction && parsed.promisedScheduling) {
+        debugPrint('ChatCoachScreen: the reply reads as a scheduling promise '
+            'but carried no task_action block. Reply was: ${parsed.text}');
+      }
 
       // A reply that was one unreadable block leaves nothing to show and
       // nothing to schedule; say so rather than open a blank bubble.

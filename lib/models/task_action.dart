@@ -148,26 +148,70 @@ class CoachReply {
 
   bool get hasAction => action != null;
 
-  /// Matches the fenced block. The closing fence is optional so a reply the
-  /// provider truncated mid-block still gets stripped rather than shown raw.
-  static final RegExp _blockPattern = RegExp(
+  /// The block as asked for: a fence tagged `task_action`.
+  ///
+  /// The closing fence is optional so a reply the provider truncated
+  /// mid-block still gets stripped rather than shown to the user raw.
+  static final RegExp _taggedBlock = RegExp(
     r'```[ \t]*task_action[ \t]*\r?\n?(.*?)(?:```|$)',
     dotAll: true,
     caseSensitive: false,
   );
 
+  /// What models actually send when they ignore the tag: a `json` fence, or
+  /// a bare one. Only treated as an action when the body really is a task —
+  /// an unrelated JSON snippet in a reply must survive untouched.
+  static final RegExp _looseBlock = RegExp(
+    r'```[ \t]*(?:json)?[ \t]*\r?\n?(.*?)(?:```|$)',
+    dotAll: true,
+    caseSensitive: false,
+  );
+
+  /// Words that mean the coach agreed to schedule something.
+  ///
+  /// Only used to notice that a reply promised a task and shipped no block,
+  /// which is worth a log line. It never invents an action: a task the user
+  /// never sees confirmed is worse than one they have to ask for twice.
+  static final RegExp _schedulingIntent = RegExp(
+    r'schedul|remind|added it|add it to|put it in|'
+    r'\u0623\u0636\u0641|\u062c\u062f\u0648\u0644|\u062a\u0630\u0643\u064a\u0631',
+    caseSensitive: false,
+  );
+
   static CoachReply parse(String content, {DateTime? now}) {
-    final RegExpMatch? match = _blockPattern.firstMatch(content);
-    if (match == null) return CoachReply(text: content);
+    // The tagged form wins, and is stripped whether or not it parses — a
+    // half-written block is never something to show the user.
+    final RegExpMatch? tagged = _taggedBlock.firstMatch(content);
+    if (tagged != null) {
+      return CoachReply(
+        // May be empty when the model replied with nothing but the block; the
+        // bubble then shows the card alone rather than the raw JSON.
+        text: content.replaceRange(tagged.start, tagged.end, '').trim(),
+        action: TaskAction.tryParse(tagged.group(1) ?? '', now: now),
+      );
+    }
 
-    final String stripped =
-        content.replaceRange(match.start, match.end, '').trim();
+    // Failing that, any fenced JSON that reads as a task. Stripped only when
+    // it actually parses, so a code sample in a reply is left alone.
+    for (final RegExpMatch match in _looseBlock.allMatches(content)) {
+      final String body = match.group(1) ?? '';
+      if (!body.contains('"title"')) continue;
 
-    return CoachReply(
-      // May be empty when the model replied with nothing but the block; the
-      // bubble then shows the card alone rather than the raw JSON.
-      text: stripped,
-      action: TaskAction.tryParse(match.group(1) ?? '', now: now),
-    );
+      final TaskAction? action = TaskAction.tryParse(body, now: now);
+      if (action == null) continue;
+
+      return CoachReply(
+        text: content.replaceRange(match.start, match.end, '').trim(),
+        action: action,
+      );
+    }
+
+    return CoachReply(text: content);
   }
+
+  /// True when the reply reads as though it agreed to schedule something.
+  ///
+  /// Paired with [hasAction] to spot a model that talked about adding a task
+  /// and then forgot the block.
+  bool get promisedScheduling => _schedulingIntent.hasMatch(text);
 }

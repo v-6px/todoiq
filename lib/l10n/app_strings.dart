@@ -157,7 +157,7 @@ abstract class AppStrings {
   // otherwise right-to-left document.
   String get reportHeadingSummary;
   String get reportHeadingBottlenecks;
-  String get reportHeadingTips;
+  String get reportHeadingNextSteps;
   String get openSettings;
   String get debriefFailed;
 
@@ -406,9 +406,9 @@ class _EnStrings extends AppStrings {
   @override
   String get reportHeadingSummary => 'Summary';
   @override
-  String get reportHeadingBottlenecks => 'Bottlenecks';
+  String get reportHeadingBottlenecks => 'Obstacles';
   @override
-  String get reportHeadingTips => 'Two things to try';
+  String get reportHeadingNextSteps => 'Tomorrow\u2019s steps';
   @override
   String get openSettings => 'Open Settings';
   @override
@@ -664,11 +664,11 @@ class _ArStrings extends AppStrings {
   @override
   String reportGeneratedAt(String when) => 'أُنشئت في $when';
   @override
-  String get reportHeadingSummary => 'الملخّص';
+  String get reportHeadingSummary => 'الملخص';
   @override
-  String get reportHeadingBottlenecks => 'العوائق';
+  String get reportHeadingBottlenecks => 'المعوقات';
   @override
-  String get reportHeadingTips => 'أمران جرّبهما';
+  String get reportHeadingNextSteps => 'خطوات الغد';
   @override
   String get openSettings => 'فتح الإعدادات';
   @override

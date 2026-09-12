@@ -152,7 +152,7 @@ void main() {
         (AppStrings s) => s.regenerateDebrief,
         (AppStrings s) => s.reportHeadingSummary,
         (AppStrings s) => s.reportHeadingBottlenecks,
-        (AppStrings s) => s.reportHeadingTips,
+        (AppStrings s) => s.reportHeadingNextSteps,
         (AppStrings s) => s.coachThinking,
         (AppStrings s) => s.coachAddTaskButton,
         (AppStrings s) => s.coachAddingTask,

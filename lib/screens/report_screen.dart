@@ -51,8 +51,13 @@ class ReportScreen extends StatefulWidget {
   static String systemPrompt(AppStrings strings) =>
       'You are a concise productivity coach reviewing a task log. '
       'Write in Markdown. Be specific and reference the actual task titles. '
-      'Never invent tasks that are not in the log. Keep the whole reply under '
-      '250 words. ${strings.replyLanguageInstruction}';
+      'Never invent tasks that are not in the log. '
+      'Aim for 250-400 words: concise, but a finished piece of writing. '
+      'Every section named below must be present and must end on a complete '
+      'sentence — never stop mid-sentence, and never leave a section empty '
+      'or unwritten because you are running long. If you are running out of '
+      'room, write less in each section rather than dropping one. '
+      '${strings.replyLanguageInstruction}';
 
   /// Builds the user turn: the log, plus what to do with it.
   ///
@@ -116,13 +121,16 @@ class ReportScreen extends StatefulWidget {
           'treat it as the primary evidence and build on it rather than '
           'speculating. Look for patterns in the timing and the kind of '
           'work. If the evidence is thin, say so rather than guessing.')
-      ..writeln('## ${strings.reportHeadingTips}')
-      ..writeln('Exactly two concrete, actionable tips tied to the tasks '
-          'above. No generic advice.')
+      ..writeln('## ${strings.reportHeadingNextSteps}')
+      ..writeln('Two or three concrete steps to take tomorrow, each tied to a '
+          'task above. No generic advice.')
       ..writeln()
       ..writeln('Write flowing prose in your reply language. Task titles are '
           'quoted from the log and stay exactly as they are spelled, even '
-          'when the rest of the sentence is in another script.');
+          'when the rest of the sentence is in another script.')
+      ..writeln('Write all three sections, in this order, and finish the '
+          'last one properly — a debrief that stops part-way is worse than a '
+          'short one.');
 
     return prompt.toString();
   }
@@ -230,7 +238,7 @@ class _ReportScreenState extends State<ReportScreen> {
             ),
           ),
         ],
-        maxTokens: 700,
+        maxTokens: AiService.debriefMaxTokens,
         temperature: 0.7,
       );
 
