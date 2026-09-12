@@ -122,6 +122,9 @@ class HomeScreen extends StatefulWidget {
   static const Key alarmBannerActionKey = Key('home_alarm_banner_action');
   static const Key alarmBannerDismissKey = Key('home_alarm_banner_dismiss');
 
+  /// The swipe-to-delete wrapper around one task, addressed by task id.
+  static Key dismissibleKey(int id) => Key('home_task_dismissible_$id');
+
   /// The day to show. Injectable so tests are not clock-dependent.
   final DateTime? day;
 
@@ -300,6 +303,69 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Reopens [task] in the sheet, prefilled.
+  ///
+  /// The sheet does the saving and the re-arming; all that is left here is to
+  /// pick up the change, since an edit can move a task off the day on screen.
+  Future<void> _editTask(Task task) async {
+    final Task? updated = await AddTaskSheet.show(
+      context,
+      day: _day,
+      task: task,
+    );
+    if (updated != null) {
+      await _loadTasks();
+    }
+  }
+
+  /// Deletes [task], with a window to take it back.
+  ///
+  /// The row goes immediately — a confirmation dialog on every swipe is the
+  /// heavier tax, because deleting is rare and undoing is cheap. The alarm is
+  /// cancelled first so a deleted task can never fire.
+  Future<void> _deleteTask(Task task) async {
+    final int? id = task.id;
+    if (id == null) return;
+
+    final AppStrings strings = AppStrings.of(context);
+
+    await NotificationService.instance.cancelNotification(id);
+    await DatabaseService.instance.deleteTask(id);
+    await _loadTasks();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(strings.taskDeleted),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 5),
+          action: SnackBarAction(
+            label: strings.undo,
+            onPressed: () => _restoreTask(task),
+          ),
+        ),
+      );
+  }
+
+  /// Puts a deleted task back, id and all.
+  ///
+  /// [Task.toMap] carries the id when it has one, so SQLite reuses the same
+  /// primary key — which keeps the restored task's alarm ids identical to the
+  /// ones that were just cancelled.
+  Future<void> _restoreTask(Task task) async {
+    try {
+      await DatabaseService.instance.insertTask(task);
+      await NotificationService.instance.trySchedule(task);
+    } catch (error, stack) {
+      debugPrint('HomeScreen: could not restore "${task.title}" with '
+          '${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'HomeScreen');
+    }
+    await _loadTasks();
+  }
+
   Future<void> _openReports() {
     return Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -406,13 +472,70 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       itemCount: _tasks.length,
       itemBuilder: (BuildContext context, int index) {
         final Task task = _tasks[index];
-        return TaskCard(
+        final TaskCard card = TaskCard(
           key: ValueKey<int?>(task.id),
           task: task,
           day: _day,
           onStatusChanged: (String status) => _changeStatus(task, status),
+          onEdit: () => _editTask(task),
+        );
+
+        final int? id = task.id;
+        if (id == null) return card;
+
+        return Dismissible(
+          key: HomeScreen.dismissibleKey(id),
+          // Either direction: which way a swipe-to-delete runs is muscle
+          // memory, and it flips with the language.
+          background: _DeleteBackground(
+            strings: strings,
+            alignment: AlignmentDirectional.centerStart,
+          ),
+          secondaryBackground: _DeleteBackground(
+            strings: strings,
+            alignment: AlignmentDirectional.centerEnd,
+          ),
+          onDismissed: (DismissDirection _) => _deleteTask(task),
+          child: card,
         );
       },
+    );
+  }
+}
+
+/// What shows behind a task as it is swiped away.
+class _DeleteBackground extends StatelessWidget {
+  final AppStrings strings;
+  final AlignmentGeometry alignment;
+
+  const _DeleteBackground({required this.strings, required this.alignment});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: AppSpacing.md),
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+      alignment: alignment,
+      decoration: BoxDecoration(
+        color: AppColors.canvasSoft,
+        borderRadius: const BorderRadius.all(Radius.circular(AppRadius.lg)),
+        border: Border.all(color: AppColors.hairline),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          const Icon(
+            Icons.delete_outline_rounded,
+            size: 18,
+            color: AppColors.primary,
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Text(
+            strings.deleteTask,
+            style: AppText.buttonCap.copyWith(color: AppColors.primary),
+          ),
+        ],
+      ),
     );
   }
 }

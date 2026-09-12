@@ -142,7 +142,7 @@ void main() {
   /// real isolate I/O. One runAsync only advances the chain by a step, so the
   /// turns are interleaved until it has run out.
   Future<void> settle(WidgetTester tester) async {
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 12; i++) {
       await tester.runAsync(
         () => Future<void>.delayed(const Duration(milliseconds: 20)),
       );
@@ -997,6 +997,205 @@ void main() {
 
       expect(find.text('التذكيرات معطّلة'), findsOneWidget);
       expect(find.text('السماح بالمنبّهات'), findsOneWidget);
+    });
+  });
+
+  group('Editing and deleting', () {
+    testWidgets('swiping a task away deletes it and cancels its alarm', (
+      WidgetTester tester,
+    ) async {
+      final int id = await seedTask(tester, 'Dentist');
+      await pumpHome(tester);
+      expect(find.text('Dentist'), findsOneWidget);
+
+      await tester.drag(
+        find.byKey(HomeScreen.dismissibleKey(id)),
+        const Offset(-500, 0),
+      );
+      await settle(tester);
+
+      expect(await readToday(tester), isEmpty);
+      expect(find.text('Dentist'), findsNothing);
+
+      // A deleted task must never be able to fire.
+      expect(cancelled, contains(id));
+    });
+
+    testWidgets('a swipe the other way deletes it too', (
+      WidgetTester tester,
+    ) async {
+      final int id = await seedTask(tester, 'Dentist');
+      await pumpHome(tester);
+
+      await tester.drag(
+        find.byKey(HomeScreen.dismissibleKey(id)),
+        const Offset(500, 0),
+      );
+      await settle(tester);
+
+      expect(await readToday(tester), isEmpty);
+    });
+
+    testWidgets('undo puts the task back with the same id', (
+      WidgetTester tester,
+    ) async {
+      final int id = await seedTask(tester, 'Dentist');
+      await pumpHome(tester);
+
+      await tester.drag(
+        find.byKey(HomeScreen.dismissibleKey(id)),
+        const Offset(-500, 0),
+      );
+      // Deleting is three async hops deep, and the snackbar only goes up
+      // once the reload lands — one settle is not always enough.
+      await settle(tester);
+      await settle(tester);
+      expect(find.text('Task deleted'), findsOneWidget);
+
+      await tester.tap(find.text('Undo'));
+      await settle(tester);
+
+      final List<Task> restored = await readToday(tester);
+      expect(restored, hasLength(1));
+      expect(restored.single.title, 'Dentist');
+      // The same primary key, so the restored task's alarm ids match the
+      // ones that were cancelled.
+      expect(restored.single.id, id);
+      expect(find.text('Dentist'), findsOneWidget);
+    });
+
+    testWidgets('deleting does not disturb the other tasks', (
+      WidgetTester tester,
+    ) async {
+      final int id = await seedTask(tester, 'Dentist', when: at(9));
+      await seedTask(tester, 'Standup', when: at(11));
+      await pumpHome(tester);
+
+      await tester.drag(
+        find.byKey(HomeScreen.dismissibleKey(id)),
+        const Offset(-500, 0),
+      );
+      await settle(tester);
+
+      final List<Task> left = await readToday(tester);
+      expect(left.single.title, 'Standup');
+    });
+
+    testWidgets('tapping a task opens it for editing, prefilled', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      await tester.tap(find.text('Dentist'));
+      await settle(tester);
+
+      expect(find.byType(AddTaskSheet), findsOneWidget);
+      expect(find.text('Edit task'), findsOneWidget);
+      expect(find.text('Save changes'), findsOneWidget);
+
+      // The field holds the task as stored, not an empty form.
+      final TextField field = tester.widget<TextField>(
+        find.byKey(AddTaskSheet.titleFieldKey),
+      );
+      expect(field.controller!.text, 'Dentist');
+    });
+
+    testWidgets('long-pressing opens the same editor', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist');
+      await pumpHome(tester);
+
+      await tester.longPress(find.text('Dentist'));
+      await settle(tester);
+
+      expect(find.text('Edit task'), findsOneWidget);
+    });
+
+    testWidgets('an edit updates the row instead of adding another', (
+      WidgetTester tester,
+    ) async {
+      final int id = await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      await tester.tap(find.text('Dentist'));
+      await settle(tester);
+
+      await tester.enterText(
+        find.byKey(AddTaskSheet.titleFieldKey),
+        'Dentist — moved',
+      );
+      await tester.tap(find.byKey(AddTaskSheet.saveButtonKey));
+      await settle(tester);
+
+      final List<Task> stored = await readToday(tester);
+      expect(stored, hasLength(1), reason: 'edit replaces, never duplicates');
+      expect(stored.single.id, id);
+      expect(stored.single.title, 'Dentist — moved');
+      expect(find.text('Dentist — moved'), findsOneWidget);
+    });
+
+    testWidgets('editing keeps the status and note already recorded', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(
+        tester,
+        'Dentist',
+        when: at(9),
+        status: TaskStatus.partial,
+      );
+      await pumpHome(tester);
+
+      await tester.tap(find.text('Dentist'));
+      await settle(tester);
+      await tester.enterText(
+        find.byKey(AddTaskSheet.titleFieldKey),
+        'Dentist visit',
+      );
+      await tester.tap(find.byKey(AddTaskSheet.saveButtonKey));
+      await settle(tester);
+
+      final List<Task> stored = await readToday(tester);
+      expect(
+        stored.single.status,
+        TaskStatus.partial,
+        reason: 'renaming a task is not the same as undoing it',
+      );
+    });
+
+    testWidgets('an edit can change the recurrence', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      await tester.tap(find.text('Dentist'));
+      await settle(tester);
+      await tester.tap(
+        find.byKey(AddTaskSheet.recurrenceKey(RecurrenceType.daily)),
+      );
+      await settle(tester);
+      await tester.tap(find.byKey(AddTaskSheet.saveButtonKey));
+      await settle(tester);
+
+      final List<Task> stored = await readToday(tester);
+      expect(stored.single.recurrenceType, RecurrenceType.daily);
+    });
+
+    testWidgets('the status buttons still work through the edit gesture', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist');
+      await pumpHome(tester);
+
+      await tester.tap(find.byKey(TaskCard.completeKey));
+      await settle(tester);
+
+      expect(find.byType(AddTaskSheet), findsNothing,
+          reason: 'a status tap must not open the editor');
+      final List<Task> stored = await readToday(tester);
+      expect(stored.single.status, TaskStatus.completed);
     });
   });
 }

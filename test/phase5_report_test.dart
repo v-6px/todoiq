@@ -10,7 +10,10 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:todo_list/l10n/app_strings.dart';
+import 'package:todo_list/l10n/bidi_text.dart';
 import 'package:todo_list/models/report_range.dart';
+import 'package:todo_list/models/saved_report.dart';
 import 'package:todo_list/models/task_model.dart';
 import 'package:todo_list/screens/report_screen.dart';
 import 'package:todo_list/screens/settings_screen.dart';
@@ -58,6 +61,7 @@ void main() {
 
     final Database database = await DatabaseService.instance.database;
     await database.delete(DatabaseService.tasksTable);
+    await database.delete(DatabaseService.reportsTable);
   });
 
   MockClient replyWith(String content, {int status = 200}) {
@@ -344,6 +348,122 @@ void main() {
 
   // ---- Screen behaviour -------------------------------------------------
 
+  group('Stat chip rendering', () {
+    /// Every Text inside one chip, in the order they are laid out.
+    List<String> chipTexts(WidgetTester tester, String label) {
+      final Finder chip = find.ancestor(
+        of: find.text(label),
+        matching: find.byType(StatChip),
+      );
+      return tester
+          .widgetList<Text>(find.descendant(of: chip, matching: find.byType(Text)))
+          .map((Text t) => t.data ?? '')
+          .toList();
+    }
+
+    testWidgets('a chip is a number and a label, and nothing else', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await pumpReport(tester);
+
+      expect(chipTexts(tester, 'Completed'), <String>['1', 'Completed']);
+
+      // The old design drew a 3px tall bar to the left of the number, which
+      // at this size reads as a pipe character stuck to the digits — "|1".
+      // One decorated box per chip means the rail has not come back.
+      final Finder chip = find.ancestor(
+        of: find.text('Completed'),
+        matching: find.byType(StatChip),
+      );
+      expect(
+        find.descendant(of: chip, matching: find.byType(Container)),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the number sits centred in its box', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await pumpReport(tester);
+
+      final Finder chip = find.ancestor(
+        of: find.text('Completed'),
+        matching: find.byType(StatChip),
+      );
+
+      // The rail used to push the digits off-centre; nothing should now.
+      expect(
+        tester.getCenter(find.text('1')).dx,
+        moreOrLessEquals(tester.getCenter(chip).dx, epsilon: 1.0),
+      );
+      expect(
+        tester.getCenter(find.text('Completed')).dx,
+        moreOrLessEquals(tester.getCenter(chip).dx, epsilon: 1.0),
+      );
+    });
+
+    testWidgets('counts are plain 0-9 digits in English', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await seed(tester, 'Half', DateTime(2026, 9, 9, 10), TaskStatus.partial);
+      await seed(tester, 'Half 2', DateTime(2026, 9, 9, 11),
+          TaskStatus.partial);
+      await pumpReport(tester);
+
+      expect(chipTexts(tester, 'Completed').first, '1');
+      expect(chipTexts(tester, 'Partial').first, '2');
+      expect(chipTexts(tester, 'Skipped').first, '0');
+    });
+
+    testWidgets('counts stay plain 0-9 digits in Arabic', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await pumpReport(tester, language: 'ar');
+
+      // A count is data, not prose: it must not come back as ١ or ٠.
+      final Iterable<StatChip> chips =
+          tester.widgetList<StatChip>(find.byType(StatChip));
+      for (final StatChip chip in chips) {
+        final List<String> texts = chipTexts(tester, chip.label);
+        expect(
+          texts.first,
+          matches(RegExp(r'^[0-9]+$')),
+          reason: 'chip "${chip.label}" rendered "${texts.first}"',
+        );
+      }
+    });
+
+    testWidgets('the three chips line up at the same width', (
+      WidgetTester tester,
+    ) async {
+      // One chip on a double-digit count, the others on single digits.
+      for (int i = 0; i < 12; i++) {
+        await seed(tester, 'Done $i', DateTime(2026, 9, 9, 9),
+            TaskStatus.completed);
+      }
+      await pumpReport(tester);
+
+      final double completed = tester
+          .getSize(find.ancestor(
+            of: find.text('Completed'),
+            matching: find.byType(StatChip),
+          ))
+          .height;
+      final double skipped = tester
+          .getSize(find.ancestor(
+            of: find.text('Skipped'),
+            matching: find.byType(StatChip),
+          ))
+          .height;
+
+      expect(completed, skipped, reason: 'chips share one baseline');
+    });
+  });
+
   group('Counts', () {
     testWidgets('shows a stat chip per terminal status', (
       WidgetTester tester,
@@ -612,6 +732,260 @@ void main() {
 
       expect(find.byKey(ReportScreen.errorKey), findsNothing);
       expect(find.byKey(ReportScreen.markdownKey), findsOneWidget);
+    });
+  });
+
+  // ---- Bidirectional text -----------------------------------------------
+
+  group('BidiText', () {
+    test('isolates a Latin run so it cannot disturb the Arabic line', () {
+      final String out = BidiText.isolateLatin('أنجزت مهمة Deep Work اليوم.');
+
+      expect(out, contains('${BidiText.fsi}Deep Work${BidiText.pdi}'));
+      expect(BidiText.strip(out), 'أنجزت مهمة Deep Work اليوم.');
+    });
+
+    test('pure Arabic is left byte-for-byte alone', () {
+      const String arabic = 'لم تكتمل المهمة بسبب ضيق الوقت.';
+      expect(BidiText.isolateLatin(arabic), arabic);
+    });
+
+    test('applying it twice changes nothing', () {
+      const String source = 'راجعت Gym مرتين';
+      final String once = BidiText.isolateLatin(source);
+      expect(BidiText.isolateLatin(once), once);
+    });
+
+    test('markdown structure survives untouched', () {
+      // Every one of these would parse differently if an isolate landed
+      // inside the syntax rather than around the words.
+      const String markdown = '## Summary\n'
+          '- **Deep Work** لم تكتمل\n'
+          '- see [the log](https://example.com/log)\n';
+      final String out = BidiText.isolateLatin(markdown);
+
+      expect(out, contains('## '));
+      expect(out, contains('- **'));
+      expect(out, contains('**${BidiText.fsi}Deep Work${BidiText.pdi}**'));
+      expect(out, contains(']('));
+      expect(BidiText.strip(out), markdown);
+    });
+
+    test('an English document is left alone in an LTR layout', () {
+      const String english = 'You finished Deep Work today.';
+      expect(BidiText.forDirection(english, isRtl: false), english);
+      expect(
+        BidiText.forDirection(english, isRtl: true),
+        isNot(english),
+      );
+    });
+  });
+
+  // ---- Saved reports ----------------------------------------------------
+
+  group('Saved debriefs', () {
+    testWidgets('a generated debrief is stored and read back', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await pumpReport(tester, client: replyWith('## Summary\nAll good.'));
+
+      await tester.tap(find.byKey(ReportScreen.generateKey));
+      await settle(tester);
+
+      final SavedReport? stored = await onDb(
+        tester,
+        () => DatabaseService.instance.getLatestReport(ReportRange.today.name),
+      );
+      expect(stored, isNotNull);
+      expect(stored!.contentMarkdown, '## Summary\nAll good.');
+      expect(stored.range, ReportRange.today);
+    });
+
+    testWidgets('reopening shows the stored debrief without calling the API', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: '## Summary\nFrom yesterday.',
+        )),
+      );
+
+      await pumpReport(tester);
+
+      expect(find.byKey(ReportScreen.markdownKey), findsOneWidget);
+      expect(find.textContaining('From yesterday.'), findsOneWidget);
+      expect(requests, isEmpty, reason: 'a stored report costs nothing');
+
+      // The button now offers to replace what is on screen, not to create it.
+      expect(find.text('Re-generate'), findsOneWidget);
+      expect(find.byKey(ReportScreen.generatedAtKey), findsOneWidget);
+    });
+
+    testWidgets('each range keeps its own debrief', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(tester, () async {
+        await DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'TODAY REPORT',
+        ));
+        await DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.thisWeek,
+          contentMarkdown: 'WEEK REPORT',
+        ));
+      });
+
+      await pumpReport(tester);
+      expect(find.textContaining('TODAY REPORT'), findsOneWidget);
+
+      await tester.tap(find.byKey(ReportScreen.rangeKey(ReportRange.thisWeek)));
+      await settle(tester);
+
+      expect(find.textContaining('WEEK REPORT'), findsOneWidget);
+      expect(find.textContaining('TODAY REPORT'), findsNothing);
+    });
+
+    testWidgets('a range with no stored debrief offers to generate one', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await pumpReport(tester);
+
+      expect(find.byKey(ReportScreen.markdownKey), findsNothing);
+      expect(find.byKey(ReportScreen.generatedAtKey), findsNothing);
+      expect(find.text('Generate AI debrief'), findsOneWidget);
+    });
+
+    testWidgets('re-generating replaces what is shown', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'OLD REPORT',
+        )),
+      );
+
+      await pumpReport(tester, client: replyWith('NEW REPORT'));
+      await tester.tap(find.byKey(ReportScreen.generateKey));
+      await settle(tester);
+
+      expect(find.textContaining('NEW REPORT'), findsOneWidget);
+      expect(find.textContaining('OLD REPORT'), findsNothing);
+
+      final SavedReport? latest = await onDb(
+        tester,
+        () => DatabaseService.instance.getLatestReport(ReportRange.today.name),
+      );
+      expect(latest!.contentMarkdown, 'NEW REPORT');
+    });
+  });
+
+  // ---- Right-to-left rendering ------------------------------------------
+
+  group('Arabic debriefs', () {
+    testWidgets('the markdown is pinned to right-to-left', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'أنجزت مهمة Deep Work اليوم.',
+        )),
+      );
+
+      await pumpReport(tester, language: 'ar');
+
+      final Directionality wrapper = tester.widget<Directionality>(
+        find
+            .ancestor(
+              of: find.byKey(ReportScreen.markdownKey),
+              matching: find.byType(Directionality),
+            )
+            .first,
+      );
+      expect(wrapper.textDirection, TextDirection.rtl);
+    });
+
+    testWidgets('Latin task titles are isolated in an Arabic debrief', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'أنجزت مهمة Deep Work اليوم.',
+        )),
+      );
+
+      await pumpReport(tester, language: 'ar');
+
+      final MarkdownBody rendered = tester.widget<MarkdownBody>(
+        find.byKey(ReportScreen.markdownKey),
+      );
+      expect(
+        rendered.data,
+        contains('${BidiText.fsi}Deep Work${BidiText.pdi}'),
+      );
+      // What was stored is untouched — the isolates are a rendering concern.
+      expect(BidiText.strip(rendered.data), 'أنجزت مهمة Deep Work اليوم.');
+    });
+
+    testWidgets('an English debrief is rendered exactly as written', (
+      WidgetTester tester,
+    ) async {
+      await seed(tester, 'Deep work', kNow, TaskStatus.completed);
+      await onDb(
+        tester,
+        () => DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'You finished Deep Work today.',
+        )),
+      );
+
+      await pumpReport(tester);
+
+      final MarkdownBody rendered = tester.widget<MarkdownBody>(
+        find.byKey(ReportScreen.markdownKey),
+      );
+      expect(rendered.data, 'You finished Deep Work today.');
+    });
+
+    test('the prompt asks for Arabic headings when replying in Arabic', () {
+      final String prompt = ReportScreen.buildDebriefPrompt(
+        ReportRange.today,
+        <Task>[],
+        kNow,
+        strings: AppStrings.ar,
+      );
+
+      expect(prompt, contains('## الملخّص'));
+      expect(prompt, contains('## العوائق'));
+      expect(prompt, contains('## أمران جرّبهما'));
+      expect(prompt, isNot(contains('## Summary')));
+      expect(prompt, isNot(contains('## Bottlenecks')));
+    });
+
+    test('the English prompt keeps the English headings', () {
+      final String prompt = ReportScreen.buildDebriefPrompt(
+        ReportRange.today,
+        <Task>[],
+        kNow,
+      );
+
+      expect(prompt, contains('## Summary'));
+      expect(prompt, contains('## Bottlenecks'));
+      expect(prompt, contains('## Two things to try'));
     });
   });
 }

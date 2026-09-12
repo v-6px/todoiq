@@ -29,10 +29,22 @@ class AddTaskSheet extends StatefulWidget {
   /// The day the sheet opens on. Defaults to today.
   final DateTime? day;
 
-  const AddTaskSheet({super.key, this.day});
+  /// The task being edited, or null to create a new one.
+  ///
+  /// One sheet for both jobs: the fields, the validation and the alarm
+  /// handling are identical, and the only real difference is whether the save
+  /// inserts a row or replaces one.
+  final Task? task;
 
-  /// Opens the sheet and resolves to the created task, or null if dismissed.
-  static Future<Task?> show(BuildContext context, {DateTime? day}) {
+  const AddTaskSheet({super.key, this.day, this.task});
+
+  /// Opens the sheet and resolves to the created or updated task, or null if
+  /// it was dismissed. Pass [task] to open in edit mode.
+  static Future<Task?> show(
+    BuildContext context, {
+    DateTime? day,
+    Task? task,
+  }) {
     return showModalBottomSheet<Task>(
       context: context,
       isScrollControlled: true,
@@ -42,7 +54,7 @@ class AddTaskSheet extends StatefulWidget {
           top: Radius.circular(AppRadius.xl),
         ),
       ),
-      builder: (BuildContext context) => AddTaskSheet(day: day),
+      builder: (BuildContext context) => AddTaskSheet(day: day, task: task),
     );
   }
 
@@ -86,9 +98,27 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
   /// Today at midnight, captured once so the quick chips stay stable.
   late final DateTime _today = Task.dayStart(widget.day ?? DateTime.now());
 
+  bool get _isEditing => widget.task != null;
+
   @override
   void initState() {
     super.initState();
+
+    final Task? existing = widget.task;
+    if (existing != null) {
+      // Every field comes back exactly as stored, so the user is editing what
+      // they actually have rather than a fresh form that looks similar.
+      _titleController.text = existing.title;
+      _date = Task.dayStart(existing.scheduledTime);
+      _time = TimeOfDay(
+        hour: existing.scheduledTime.hour,
+        minute: existing.scheduledTime.minute,
+      );
+      _recurrence = existing.recurrenceType;
+      _repeatDays.addAll(existing.repeatDays ?? const <int>[]);
+      return;
+    }
+
     _date = _today;
 
     // Default to the next round half hour — the most common intent is
@@ -181,25 +211,43 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
       _saving = true;
     });
 
-    final Task task = Task(
-      title: title,
-      scheduledTime: _scheduledDateTime,
-      recurrenceType: _recurrence,
-      repeatDays: _recurrence == RecurrenceType.weeklyDays
-          ? (_repeatDays.toList()..sort())
-          : null,
-    );
+    final List<int>? repeatDays = _recurrence == RecurrenceType.weeklyDays
+        ? (_repeatDays.toList()..sort())
+        : null;
+
+    // In edit mode the status, note and creation time are carried over —
+    // changing when a task is due must not quietly mark it undone.
+    final Task task = _isEditing
+        ? widget.task!.copyWith(
+            title: title,
+            scheduledTime: _scheduledDateTime,
+            recurrenceType: _recurrence,
+            repeatDays: repeatDays,
+            clearRepeatDays: repeatDays == null,
+          )
+        : Task(
+            title: title,
+            scheduledTime: _scheduledDateTime,
+            recurrenceType: _recurrence,
+            repeatDays: repeatDays,
+          );
 
     final Task saved;
     try {
-      final int id = await DatabaseService.instance.insertTask(task);
-      saved = task.copyWith(id: id);
+      if (_isEditing) {
+        await DatabaseService.instance.updateTask(task);
+        saved = task;
+      } else {
+        final int id = await DatabaseService.instance.insertTask(task);
+        saved = task.copyWith(id: id);
+      }
     } catch (error, stack) {
       // Only a genuine write failure lands here. The exact exception is
       // logged and shown, because "could not save" on its own leaves nobody —
       // user or developer — anything to act on.
-      debugPrint('AddTaskSheet: insert failed for "${task.title}" '
-          '(${task.toMap()}) with ${error.runtimeType}: $error');
+      debugPrint('AddTaskSheet: ${_isEditing ? 'update' : 'insert'} failed '
+          'for "${task.title}" (${task.toMap()}) with '
+          '${error.runtimeType}: $error');
       debugPrintStack(stackTrace: stack, label: 'AddTaskSheet._save');
 
       if (!mounted) return;
@@ -271,7 +319,10 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
                   ),
                 ),
                 const SizedBox(height: AppSpacing.xl),
-                Text(strings.addTaskTitle, style: AppText.displayMd),
+                Text(
+                  _isEditing ? strings.editTaskTitle : strings.addTaskTitle,
+                  style: AppText.displayMd,
+                ),
                 const SizedBox(height: AppSpacing.lg),
                 TextField(
                   key: AddTaskSheet.titleFieldKey,
@@ -325,7 +376,11 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
                     key: AddTaskSheet.saveButtonKey,
                     onPressed: _saving ? null : _save,
                     child: Text(
-                      _saving ? strings.addTaskSaving : strings.addTaskButton,
+                      _saving
+                          ? strings.addTaskSaving
+                          : _isEditing
+                              ? strings.editTaskButton
+                              : strings.addTaskButton,
                     ),
                   ),
                 ),

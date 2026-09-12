@@ -3,6 +3,8 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:todo_list/models/report_range.dart';
+import 'package:todo_list/models/saved_report.dart';
 import 'package:todo_list/models/task_model.dart';
 import 'package:todo_list/services/database_service.dart';
 import 'package:todo_list/services/settings_service.dart';
@@ -333,6 +335,69 @@ void main() {
       await DatabaseService.instance.close();
       DatabaseService.debugDatabaseName = 'phase1_test.db';
     });
+
+    test('a v3 database gains the reports table without losing tasks',
+        () async {
+      await DatabaseService.instance.close();
+
+      final String path = p.join(
+        await databaseFactory.getDatabasesPath(),
+        'migration_v3_test.db',
+      );
+      await databaseFactory.deleteDatabase(path);
+
+      // The v3 schema: everything the current one has except reports.
+      final Database v3 = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 3,
+          onCreate: (Database db, int version) async {
+            await db.execute(
+              'CREATE TABLE tasks ('
+              'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+              'title TEXT NOT NULL, '
+              'scheduled_time INTEGER NOT NULL, '
+              "status TEXT NOT NULL DEFAULT 'pending', "
+              'created_at INTEGER NOT NULL, '
+              'note TEXT, '
+              "recurrence_type TEXT NOT NULL DEFAULT 'none', "
+              'repeat_days TEXT, '
+              'status_date INTEGER)',
+            );
+          },
+        ),
+      );
+      await v3.insert('tasks', <String, Object?>{
+        'title': 'Task from before reports existed',
+        'scheduled_time': DateTime(2026, 9, 12, 9).millisecondsSinceEpoch,
+        'status': TaskStatus.pending,
+        'created_at': DateTime(2026, 9, 11).millisecondsSinceEpoch,
+        'recurrence_type': RecurrenceType.none,
+      });
+      await v3.close();
+
+      DatabaseService.debugDatabaseName = 'migration_v3_test.db';
+
+      // The upgrade runs on first access and must not touch the tasks.
+      final List<Task> tasks = await DatabaseService.instance
+          .getTasksForDate(DateTime(2026, 9, 12));
+      expect(tasks.single.title, 'Task from before reports existed');
+
+      // And the new table is there and usable.
+      expect(await DatabaseService.instance.getLatestReport('today'), isNull);
+      await DatabaseService.instance.insertReport(SavedReport.forRange(
+        ReportRange.today,
+        contentMarkdown: 'first report after upgrading',
+      ));
+      expect(
+        (await DatabaseService.instance.getLatestReport('today'))!
+            .contentMarkdown,
+        'first report after upgrading',
+      );
+
+      await DatabaseService.instance.close();
+      DatabaseService.debugDatabaseName = 'phase1_test.db';
+    });
   });
 
   group('SettingsService', () {
@@ -387,6 +452,108 @@ void main() {
         expect(preset.baseUrl.endsWith('/'), isFalse, reason: preset.label);
         expect(preset.modelName, isNotEmpty, reason: preset.label);
       }
+    });
+  });
+
+  group('Saved reports', () {
+    Future<void> clearReports() async {
+      final Database db = await DatabaseService.instance.database;
+      await db.delete(DatabaseService.reportsTable);
+    }
+
+    setUp(clearReports);
+
+    test('a report round-trips through the table', () async {
+      final DateTime written = DateTime(2026, 9, 9, 18, 30);
+      await DatabaseService.instance.insertReport(SavedReport.forRange(
+        ReportRange.thisWeek,
+        contentMarkdown: '## Summary\nA good week.',
+        createdAt: written,
+      ));
+
+      final SavedReport? stored = await DatabaseService.instance
+          .getLatestReport(ReportRange.thisWeek.name);
+
+      expect(stored, isNotNull);
+      expect(stored!.contentMarkdown, '## Summary\nA good week.');
+      expect(stored.periodType, 'thisWeek');
+      expect(stored.range, ReportRange.thisWeek);
+      expect(stored.createdAt, written);
+      expect(stored.id, isNotNull);
+    });
+
+    test('the newest report for a period wins', () async {
+      for (int day = 1; day <= 3; day++) {
+        await DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'report $day',
+          createdAt: DateTime(2026, 9, day),
+        ));
+      }
+
+      final SavedReport? latest =
+          await DatabaseService.instance.getLatestReport('today');
+      expect(latest!.contentMarkdown, 'report 3');
+    });
+
+    test('periods do not read each other\'s reports', () async {
+      await DatabaseService.instance.insertReport(SavedReport.forRange(
+        ReportRange.today,
+        contentMarkdown: 'daily',
+      ));
+
+      expect(
+        await DatabaseService.instance.getLatestReport('thisWeek'),
+        isNull,
+      );
+      expect(
+        (await DatabaseService.instance.getLatestReport('today'))!
+            .contentMarkdown,
+        'daily',
+      );
+    });
+
+    test('history is capped so the table cannot grow without bound', () async {
+      for (int day = 1; day <= 9; day++) {
+        await DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'report $day',
+          createdAt: DateTime(2026, 9, day),
+        ));
+      }
+
+      final List<SavedReport> kept =
+          await DatabaseService.instance.getReports('today');
+
+      expect(kept, hasLength(DatabaseService.reportsKeptPerPeriod));
+      expect(kept.first.contentMarkdown, 'report 9');
+      // The oldest are the ones dropped, newest first in the result.
+      expect(kept.last.contentMarkdown, 'report 5');
+    });
+
+    test('pruning one period leaves the others alone', () async {
+      await DatabaseService.instance.insertReport(SavedReport.forRange(
+        ReportRange.thisWeek,
+        contentMarkdown: 'weekly',
+      ));
+      for (int day = 1; day <= 9; day++) {
+        await DatabaseService.instance.insertReport(SavedReport.forRange(
+          ReportRange.today,
+          contentMarkdown: 'report $day',
+          createdAt: DateTime(2026, 9, day),
+        ));
+      }
+
+      expect(await DatabaseService.instance.getReports('thisWeek'),
+          hasLength(1));
+    });
+
+    test('an unrecognised period name does not crash the model', () {
+      final SavedReport orphan = SavedReport(
+        periodType: 'lastQuarter',
+        contentMarkdown: 'written by a future build',
+      );
+      expect(orphan.range, isNull);
     });
   });
 }

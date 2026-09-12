@@ -2,8 +2,13 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 
-/// A single count in the report's summary row: a number over a label, with a
-/// thin accent rail echoing the task card's status colour.
+/// A single count in the report's summary row: the number over its label.
+///
+/// Deliberately has no accent rail. An earlier version drew a 3px vertical bar
+/// to the left of the number, which at this size reads as a pipe character
+/// glued to the digits — "|0" rather than a divider. The status colour is
+/// carried by the label instead, and the label already names the status, so
+/// colour is never the only thing distinguishing one chip from another.
 class StatChip extends StatelessWidget {
   final String label;
   final int count;
@@ -21,6 +26,10 @@ class StatChip extends StatelessWidget {
     return Semantics(
       label: '$count $label',
       child: Container(
+        // A floor rather than a fixed width: single-digit counts still make a
+        // box wide enough to sit level with its neighbours, and a long
+        // translated label can push past it.
+        constraints: const BoxConstraints(minWidth: 88),
         padding: const EdgeInsets.symmetric(
           horizontal: AppSpacing.lg,
           vertical: AppSpacing.md,
@@ -30,26 +39,29 @@ class StatChip extends StatelessWidget {
           borderRadius: const BorderRadius.all(Radius.circular(AppRadius.md)),
           border: Border.all(color: AppColors.hairline),
         ),
-        child: Row(
+        child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: <Widget>[
-            Container(
-              width: 3,
-              height: 28,
-              margin: const EdgeInsets.only(right: AppSpacing.md),
-              decoration: BoxDecoration(
-                color: accent,
-                borderRadius:
-                    const BorderRadius.all(Radius.circular(AppRadius.xs)),
+            Text(
+              // int.toString, so the digits are plain 0-9 whatever the app
+              // language is. A count is data, not prose: it lines up with the
+              // other chips and stays legible in either script.
+              '$count',
+              textAlign: TextAlign.center,
+              style: AppText.displayMd.copyWith(
+                // Tabular figures keep the three chips the same width as the
+                // counts change, so the row does not shuffle on each reload.
+                fontFeatures: const <FontFeature>[
+                  FontFeature.tabularFigures(),
+                ],
               ),
             ),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                Text('$count', style: AppText.displayMd),
-                Text(label, style: AppText.micro),
-              ],
+            const SizedBox(height: AppSpacing.xxs),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: AppText.micro.copyWith(color: accent),
             ),
           ],
         ),

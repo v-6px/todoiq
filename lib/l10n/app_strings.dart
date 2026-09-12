@@ -76,6 +76,13 @@ abstract class AppStrings {
   String get exactAlarmBannerDismiss;
   String get addTaskButton;
   String get addTaskSaving;
+
+  // --- Editing and deleting ---------------------------------------------
+  String get editTaskTitle;
+  String get editTaskButton;
+  String get deleteTask;
+  String get taskDeleted;
+  String get undo;
   String get changeTime;
   String get timeHasPassedNotice;
   String get dateLabel;
@@ -140,6 +147,17 @@ abstract class AppStrings {
   String get generatingDebrief;
   String get noTasksInRange;
   String get nothingResolvedYet;
+  String get regenerateDebrief;
+
+  /// Caption over a stored debrief, e.g. "Generated 12 Sep, 14:30".
+  String reportGeneratedAt(String when);
+
+  // Section headings the model is told to write. Localised so an Arabic
+  // debrief does not come back with English headings stranded in an
+  // otherwise right-to-left document.
+  String get reportHeadingSummary;
+  String get reportHeadingBottlenecks;
+  String get reportHeadingTips;
   String get openSettings;
   String get debriefFailed;
 
@@ -250,6 +268,16 @@ class _EnStrings extends AppStrings {
   String get addTaskButton => 'Add task';
   @override
   String get addTaskSaving => 'Saving…';
+  @override
+  String get editTaskTitle => 'Edit task';
+  @override
+  String get editTaskButton => 'Save changes';
+  @override
+  String get deleteTask => 'Delete';
+  @override
+  String get taskDeleted => 'Task deleted';
+  @override
+  String get undo => 'Undo';
   @override
   String get changeTime => 'Change';
   @override
@@ -372,6 +400,16 @@ class _EnStrings extends AppStrings {
       'Nothing has been marked done, partial or skipped yet — the debrief '
       'will have little to work with.';
   @override
+  String get regenerateDebrief => 'Re-generate';
+  @override
+  String reportGeneratedAt(String when) => 'Generated $when';
+  @override
+  String get reportHeadingSummary => 'Summary';
+  @override
+  String get reportHeadingBottlenecks => 'Bottlenecks';
+  @override
+  String get reportHeadingTips => 'Two things to try';
+  @override
   String get openSettings => 'Open Settings';
   @override
   String get debriefFailed => 'Something went wrong generating the debrief.';
@@ -492,6 +530,16 @@ class _ArStrings extends AppStrings {
   @override
   String get addTaskSaving => 'جارٍ الحفظ…';
   @override
+  String get editTaskTitle => 'تعديل المهمة';
+  @override
+  String get editTaskButton => 'حفظ التعديلات';
+  @override
+  String get deleteTask => 'حذف';
+  @override
+  String get taskDeleted => 'حُذفت المهمة';
+  @override
+  String get undo => 'تراجع';
+  @override
   String get changeTime => 'تغيير';
   @override
   String get timeHasPassedNotice =>
@@ -611,6 +659,16 @@ class _ArStrings extends AppStrings {
   String get nothingResolvedYet =>
       'لم تُعلَّم أي مهمة كمكتملة أو جزئية أو متجاوَزة بعد — لن تجد الحصيلة '
       'الكثير لتحلّله.';
+  @override
+  String get regenerateDebrief => 'إعادة إنشاء';
+  @override
+  String reportGeneratedAt(String when) => 'أُنشئت في $when';
+  @override
+  String get reportHeadingSummary => 'الملخّص';
+  @override
+  String get reportHeadingBottlenecks => 'العوائق';
+  @override
+  String get reportHeadingTips => 'أمران جرّبهما';
   @override
   String get openSettings => 'فتح الإعدادات';
   @override

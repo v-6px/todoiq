@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import '../models/saved_report.dart';
 import '../models/task_model.dart';
 
 /// Owns the on-device SQLite database.
@@ -10,9 +11,17 @@ import '../models/task_model.dart';
 /// holds one lazily-opened [Database] handle for the life of the process.
 class DatabaseService {
   static const String _databaseName = 'task_master.db';
-  static const int _databaseVersion = 3;
+  static const int _databaseVersion = 4;
 
   static const String tasksTable = 'tasks';
+  static const String reportsTable = 'reports';
+
+  /// How many debriefs to keep per range.
+  ///
+  /// Only the newest is ever shown, but a handful of older ones cost almost
+  /// nothing and leave room for a history view later. The cap is what stops
+  /// the table growing without bound on a heavily used install.
+  static const int reportsKeptPerPeriod = 5;
 
   /// Overrides the database file name.
   ///
@@ -64,6 +73,27 @@ class DatabaseService {
     await db.execute(
       'CREATE INDEX idx_tasks_scheduled_time ON $tasksTable (scheduled_time)',
     );
+
+    await _createReportsTable(db);
+  }
+
+  /// Saved debriefs. Separate from tasks: a report is a snapshot of what the
+  /// model said at a moment, and must not change when a task later does.
+  Future<void> _createReportsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE $reportsTable (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_type TEXT NOT NULL,
+        content_markdown TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    ''');
+
+    // The only query is "newest for this period".
+    await db.execute(
+      'CREATE INDEX idx_reports_period ON $reportsTable '
+      '(period_type, created_at DESC)',
+    );
   }
 
   /// Migrates an existing install forward.
@@ -86,6 +116,10 @@ class DatabaseService {
       await db.execute(
         'ALTER TABLE $tasksTable ADD COLUMN status_date INTEGER',
       );
+    }
+    if (oldVersion < 4) {
+      // Purely additive: existing installs gain an empty report history.
+      await _createReportsTable(db);
     }
   }
 
@@ -306,6 +340,56 @@ class DatabaseService {
       counts[occurrence.status] = (counts[occurrence.status] ?? 0) + 1;
     }
     return counts;
+  }
+
+  // --- Saved reports ------------------------------------------------------
+
+  /// Stores [report] and prunes that period back to
+  /// [reportsKeptPerPeriod] rows.
+  Future<int> insertReport(SavedReport report) async {
+    final Database db = await database;
+    final int id = await db.insert(reportsTable, report.toMap());
+
+    await db.delete(
+      reportsTable,
+      where: 'period_type = ? AND id NOT IN ('
+          'SELECT id FROM $reportsTable WHERE period_type = ? '
+          'ORDER BY created_at DESC, id DESC LIMIT ?)',
+      whereArgs: <Object?>[
+        report.periodType,
+        report.periodType,
+        reportsKeptPerPeriod,
+      ],
+    );
+
+    return id;
+  }
+
+  /// The most recent debrief written for [periodType], or null if there is
+  /// none — which is what the report screen shows before the first generate.
+  Future<SavedReport?> getLatestReport(String periodType) async {
+    final Database db = await database;
+    final List<Map<String, Object?>> rows = await db.query(
+      reportsTable,
+      where: 'period_type = ?',
+      whereArgs: <Object?>[periodType],
+      orderBy: 'created_at DESC, id DESC',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return SavedReport.fromMap(rows.first);
+  }
+
+  /// Every stored debrief for [periodType], newest first.
+  Future<List<SavedReport>> getReports(String periodType) async {
+    final Database db = await database;
+    final List<Map<String, Object?>> rows = await db.query(
+      reportsTable,
+      where: 'period_type = ?',
+      whereArgs: <Object?>[periodType],
+      orderBy: 'created_at DESC, id DESC',
+    );
+    return rows.map(SavedReport.fromMap).toList();
   }
 
   /// Closes the handle so the next access reopens it. Mainly for tests.

@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart';
+// intl exports a TextDirection of its own, which would shadow the one
+// Directionality needs.
+import 'package:intl/intl.dart' hide TextDirection;
 
 import '../l10n/app_strings.dart';
+import '../l10n/bidi_text.dart';
 import '../models/report_range.dart';
+import '../models/saved_report.dart';
 import '../models/task_model.dart';
 import '../services/ai_service.dart';
 import '../services/database_service.dart';
@@ -22,6 +26,7 @@ class ReportScreen extends StatefulWidget {
   static const Key markdownKey = Key('report_markdown');
   static const Key errorKey = Key('report_error');
   static const Key settingsShortcutKey = Key('report_settings_shortcut');
+  static const Key generatedAtKey = Key('report_generated_at');
 
   static Key rangeKey(ReportRange range) => Key('report_range_${range.name}');
 
@@ -98,19 +103,26 @@ class ReportScreen extends StatefulWidget {
       ..writeln(section('STILL PENDING (not yet actioned)',
           TaskStatus.pending))
       ..writeln()
-      ..writeln('Write the debrief with these Markdown sections:')
-      ..writeln('## Summary')
+      ..writeln('Write the debrief with these Markdown sections, using these '
+          'headings exactly as written — they are already in the language '
+          'you are replying in, so copy them verbatim and do not translate '
+          'or re-word them:')
+      ..writeln('## ${strings.reportHeadingSummary}')
       ..writeln('Two sentences on how the period went, contrasting what was '
           'completed against what was only partial or skipped.')
-      ..writeln('## Bottlenecks')
+      ..writeln('## ${strings.reportHeadingBottlenecks}')
       ..writeln('Identify what is blocking the PARTIAL tasks specifically — '
           'why work starts but does not finish. Where a reason is quoted, '
           'treat it as the primary evidence and build on it rather than '
           'speculating. Look for patterns in the timing and the kind of '
           'work. If the evidence is thin, say so rather than guessing.')
-      ..writeln('## Two things to try')
+      ..writeln('## ${strings.reportHeadingTips}')
       ..writeln('Exactly two concrete, actionable tips tied to the tasks '
-          'above. No generic advice.');
+          'above. No generic advice.')
+      ..writeln()
+      ..writeln('Write flowing prose in your reply language. Task titles are '
+          'quoted from the log and stay exactly as they are spelled, even '
+          'when the rest of the sentence is in another script.');
 
     return prompt.toString();
   }
@@ -128,6 +140,14 @@ class _ReportScreenState extends State<ReportScreen> {
 
   bool _generating = false;
   String? _debrief;
+
+  /// When the debrief on screen was written, or null if it is unsaved.
+  ///
+  /// Doubles as the "this came from storage" flag: a report with a timestamp
+  /// is one the user has seen before, so the button offers to replace it
+  /// rather than to create one.
+  DateTime? _debriefAt;
+
   String? _error;
   bool _errorIsConfiguration = false;
 
@@ -151,9 +171,17 @@ class _ReportScreenState extends State<ReportScreen> {
       _range.start(_now),
       _range.end(_now),
     );
+
+    // The last debrief written for this range, so reopening the screen costs
+    // nothing and the user sees what they already paid for.
+    final SavedReport? saved =
+        await DatabaseService.instance.getLatestReport(_range.name);
+
     if (!mounted) return;
     setState(() {
       _summary = ReportSummary.fromCounts(counts);
+      _debrief = saved?.contentMarkdown;
+      _debriefAt = saved?.createdAt;
       _loadingCounts = false;
     });
   }
@@ -163,8 +191,10 @@ class _ReportScreenState extends State<ReportScreen> {
     setState(() {
       _range = range;
       _loadingCounts = true;
-      // The previous debrief described a different window.
+      // The previous debrief described a different window; _loadCounts puts
+      // this range's own stored one back in its place, if there is one.
       _debrief = null;
+      _debriefAt = null;
       _error = null;
     });
     await _loadCounts();
@@ -204,9 +234,17 @@ class _ReportScreenState extends State<ReportScreen> {
         temperature: 0.7,
       );
 
+      // Stored exactly as written, before any rendering is applied to it.
+      final SavedReport saved = SavedReport.forRange(
+        _range,
+        contentMarkdown: reply,
+      );
+      await DatabaseService.instance.insertReport(saved);
+
       if (!mounted) return;
       setState(() {
         _debrief = reply;
+        _debriefAt = saved.createdAt;
         _generating = false;
       });
     } on AiException catch (error) {
@@ -258,7 +296,7 @@ class _ReportScreenState extends State<ReportScreen> {
             ],
             if (_debrief != null) ...<Widget>[
               const SizedBox(height: AppSpacing.xl),
-              _debriefPanel(),
+              _debriefPanel(strings),
             ],
           ],
         ),
@@ -343,7 +381,9 @@ class _ReportScreenState extends State<ReportScreen> {
             child: Text(
               _generating
                   ? strings.generatingDebrief
-                  : strings.generateDebrief,
+                  : _debrief == null
+                      ? strings.generateDebrief
+                      : strings.regenerateDebrief,
             ),
           ),
         ),
@@ -408,19 +448,50 @@ class _ReportScreenState extends State<ReportScreen> {
     );
   }
 
-  Widget _debriefPanel() {
-    return Container(
-      padding: const EdgeInsets.all(AppSpacing.lg),
-      decoration: BoxDecoration(
-        color: AppColors.canvas,
-        borderRadius: const BorderRadius.all(Radius.circular(AppRadius.lg)),
-        border: Border.all(color: AppColors.hairline),
-      ),
-      child: MarkdownBody(
-        key: ReportScreen.markdownKey,
-        data: _debrief!,
-        styleSheet: _markdownStyle,
-      ),
+  Widget _debriefPanel(AppStrings strings) {
+    final TextDirection direction = strings.textDirection;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        if (_debriefAt != null) ...<Widget>[
+          Text(
+            strings.reportGeneratedAt(
+              DateFormat('d MMM, HH:mm', strings.languageCode)
+                  .format(_debriefAt!),
+            ),
+            key: ReportScreen.generatedAtKey,
+            style: AppText.micro.copyWith(color: AppColors.inkFaint),
+          ),
+          const SizedBox(height: AppSpacing.sm),
+        ],
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(AppSpacing.lg),
+          decoration: BoxDecoration(
+            color: AppColors.canvas,
+            borderRadius:
+                const BorderRadius.all(Radius.circular(AppRadius.lg)),
+            border: Border.all(color: AppColors.hairline),
+          ),
+          // Pinned to the language's own direction rather than inherited, so
+          // the debrief lays out right-to-left even if it is ever rendered
+          // somewhere that has not set a direction.
+          child: Directionality(
+            textDirection: direction,
+            child: MarkdownBody(
+              key: ReportScreen.markdownKey,
+              // Latin task titles are isolated so they cannot drag the
+              // surrounding Arabic punctuation to the wrong end of the line.
+              data: BidiText.forDirection(
+                _debrief!,
+                isRtl: direction == TextDirection.rtl,
+              ),
+              styleSheet: _markdownStyle,
+            ),
+          ),
+        ),
+      ],
     );
   }
 

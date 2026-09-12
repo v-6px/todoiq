@@ -30,12 +30,17 @@ class TaskCard extends StatelessWidget {
 
   final VoidCallback? onDelete;
 
+  /// Opens the task for editing. Wired to both tap and long-press on the
+  /// card body — the status buttons sit above it and keep their own taps.
+  final VoidCallback? onEdit;
+
   const TaskCard({
     super.key,
     required this.task,
     required this.onStatusChanged,
     this.day,
     this.onDelete,
+    this.onEdit,
   });
 
   @override
@@ -49,144 +54,150 @@ class TaskCard extends StatelessWidget {
 
     return Semantics(
       label: '${task.title}, ${statusLabel(status, strings)}',
-      child: Container(
-        margin: const EdgeInsets.only(bottom: AppSpacing.md),
-        decoration: BoxDecoration(
-          // Resolved tasks recede onto the soft canvas so the pending ones
-          // carry the eye.
-          color: isResolved ? AppColors.canvasSoft : AppColors.canvas,
-          borderRadius:
-              const BorderRadius.all(Radius.circular(AppRadius.lg)),
-          border: Border.all(color: AppColors.hairline),
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: <Widget>[
-            // A 3px accent rail is the only status colour on the card; the
-            // icons carry the meaning, so colour is never the sole channel.
-            Container(
-              width: 3,
-              height: (note != null || task.isRecurring) ? 72 : 56,
-              margin: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-              decoration: BoxDecoration(
-                color: isResolved ? accent : AppColors.hairline,
-                borderRadius:
-                    const BorderRadius.all(Radius.circular(AppRadius.xs)),
-              ),
-            ),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(
-                  0,
-                  AppSpacing.lg,
-                  AppSpacing.sm,
-                  AppSpacing.lg,
+      button: onEdit != null,
+      child: GestureDetector(
+        onTap: onEdit,
+        onLongPress: onEdit,
+        // Opaque so a tap on the padding between the status buttons still
+        // reaches the card rather than falling through to the list.
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          margin: const EdgeInsets.only(bottom: AppSpacing.md),
+          decoration: BoxDecoration(
+            // Resolved tasks recede onto the soft canvas so the pending ones
+            // carry the eye.
+            color: isResolved ? AppColors.canvasSoft : AppColors.canvas,
+            borderRadius: const BorderRadius.all(Radius.circular(AppRadius.lg)),
+            border: Border.all(color: AppColors.hairline),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              // A 3px accent rail is the only status colour on the card; the
+              // icons carry the meaning, so colour is never the sole channel.
+              Container(
+                width: 3,
+                height: (note != null || task.isRecurring) ? 72 : 56,
+                margin: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+                decoration: BoxDecoration(
+                  color: isResolved ? accent : AppColors.hairline,
+                  borderRadius: const BorderRadius.all(
+                    Radius.circular(AppRadius.xs),
+                  ),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Text(
-                      task.title,
-                      style: AppText.bodyMd.copyWith(
-                        color: isResolved ? AppColors.inkMute : AppColors.ink,
-                        decoration: status == TaskStatus.completed
-                            ? TextDecoration.lineThrough
-                            : null,
-                        decorationColor: AppColors.inkFaint,
-                      ),
-                    ),
-                    const SizedBox(height: AppSpacing.xxs),
-                    Row(
-                      children: <Widget>[
-                        Text(
-                          formatTime(
-                            task.scheduledTime,
-                            strings.languageCode,
-                          ),
-                          style: AppText.micro,
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    0,
+                    AppSpacing.lg,
+                    AppSpacing.sm,
+                    AppSpacing.lg,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        task.title,
+                        style: AppText.bodyMd.copyWith(
+                          color: isResolved ? AppColors.inkMute : AppColors.ink,
+                          decoration: status == TaskStatus.completed
+                              ? TextDecoration.lineThrough
+                              : null,
+                          decorationColor: AppColors.inkFaint,
                         ),
-                        if (isResolved) ...<Widget>[
-                          const Text(
-                            ' · ',
+                      ),
+                      const SizedBox(height: AppSpacing.xxs),
+                      Row(
+                        children: <Widget>[
+                          Text(
+                            formatTime(
+                              task.scheduledTime,
+                              strings.languageCode,
+                            ),
                             style: AppText.micro,
                           ),
-                          Text(
-                            statusLabel(status, strings),
-                            style: AppText.micro.copyWith(color: accent),
-                          ),
-                        ],
-                        if (task.isRecurring) ...<Widget>[
-                          const SizedBox(width: AppSpacing.sm),
-                          const Icon(
-                            Icons.repeat_rounded,
-                            size: 12,
-                            color: AppColors.inkFaint,
-                          ),
-                          const SizedBox(width: AppSpacing.xs),
-                          Flexible(
-                            child: Text(
-                              recurrenceLabel(task, strings),
-                              style: AppText.micro
-                                  .copyWith(color: AppColors.inkFaint),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                          if (isResolved) ...<Widget>[
+                            const Text(' · ', style: AppText.micro),
+                            Text(
+                              statusLabel(status, strings),
+                              style: AppText.micro.copyWith(color: accent),
                             ),
-                          ),
+                          ],
+                          if (task.isRecurring) ...<Widget>[
+                            const SizedBox(width: AppSpacing.sm),
+                            const Icon(
+                              Icons.repeat_rounded,
+                              size: 12,
+                              color: AppColors.inkFaint,
+                            ),
+                            const SizedBox(width: AppSpacing.xs),
+                            Flexible(
+                              child: Text(
+                                recurrenceLabel(task, strings),
+                                style: AppText.micro.copyWith(
+                                  color: AppColors.inkFaint,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
                         ],
-                      ],
-                    ),
-                    // The reason the user gave, kept quiet but visible so the
-                    // card stays an honest record of the day.
-                    if (note != null && note.trim().isNotEmpty) ...<Widget>[
-                      const SizedBox(height: AppSpacing.xs),
-                      Text(
-                        note.trim(),
-                        style: AppText.micro.copyWith(
-                          color: AppColors.inkFaint,
-                          fontStyle: FontStyle.italic,
-                        ),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
                       ),
+                      // The reason the user gave, kept quiet but visible so the
+                      // card stays an honest record of the day.
+                      if (note != null && note.trim().isNotEmpty) ...<Widget>[
+                        const SizedBox(height: AppSpacing.xs),
+                        Text(
+                          note.trim(),
+                          style: AppText.micro.copyWith(
+                            color: AppColors.inkFaint,
+                            fontStyle: FontStyle.italic,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
                     ],
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(right: AppSpacing.sm),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    _ActionButton(
+                      buttonKey: completeKey,
+                      icon: Icons.check_rounded,
+                      tooltip: strings.actionComplete,
+                      activeColor: statusColor(TaskStatus.completed),
+                      isActive: status == TaskStatus.completed,
+                      onPressed: () => onStatusChanged(TaskStatus.completed),
+                    ),
+                    _ActionButton(
+                      buttonKey: partialKey,
+                      icon: Icons.remove_rounded,
+                      tooltip: strings.actionPartial,
+                      activeColor: statusColor(TaskStatus.partial),
+                      isActive: status == TaskStatus.partial,
+                      onPressed: () => onStatusChanged(TaskStatus.partial),
+                    ),
+                    _ActionButton(
+                      buttonKey: skipKey,
+                      icon: Icons.close_rounded,
+                      tooltip: strings.actionSkip,
+                      activeColor: statusColor(TaskStatus.skipped),
+                      isActive: status == TaskStatus.skipped,
+                      onPressed: () => onStatusChanged(TaskStatus.skipped),
+                    ),
                   ],
                 ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.only(right: AppSpacing.sm),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  _ActionButton(
-                    buttonKey: completeKey,
-                    icon: Icons.check_rounded,
-                    tooltip: strings.actionComplete,
-                    activeColor: statusColor(TaskStatus.completed),
-                    isActive: status == TaskStatus.completed,
-                    onPressed: () => onStatusChanged(TaskStatus.completed),
-                  ),
-                  _ActionButton(
-                    buttonKey: partialKey,
-                    icon: Icons.remove_rounded,
-                    tooltip: strings.actionPartial,
-                    activeColor: statusColor(TaskStatus.partial),
-                    isActive: status == TaskStatus.partial,
-                    onPressed: () => onStatusChanged(TaskStatus.partial),
-                  ),
-                  _ActionButton(
-                    buttonKey: skipKey,
-                    icon: Icons.close_rounded,
-                    tooltip: strings.actionSkip,
-                    activeColor: statusColor(TaskStatus.skipped),
-                    isActive: status == TaskStatus.skipped,
-                    onPressed: () => onStatusChanged(TaskStatus.skipped),
-                  ),
-                ],
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -219,8 +230,9 @@ class TaskCard extends StatelessWidget {
     final List<int> days = task.repeatDays ?? const <int>[];
     if (days.isEmpty) return '';
 
-    final List<String> labels =
-        AddTaskSheet.weekdayLabels(strings.languageCode);
+    final List<String> labels = AddTaskSheet.weekdayLabels(
+      strings.languageCode,
+    );
     return strings.repeatsOn(
       days.map((int weekday) => labels[weekday - 1]).join(', '),
     );
@@ -271,20 +283,21 @@ class _ActionButton extends StatelessWidget {
           label: tooltip,
           child: Material(
             color: isActive ? activeColor : AppColors.canvas,
-            borderRadius:
-                const BorderRadius.all(Radius.circular(AppRadius.md)),
+            borderRadius: const BorderRadius.all(Radius.circular(AppRadius.md)),
             child: InkWell(
               key: buttonKey,
               onTap: onPressed,
-              borderRadius:
-                  const BorderRadius.all(Radius.circular(AppRadius.md)),
+              borderRadius: const BorderRadius.all(
+                Radius.circular(AppRadius.md),
+              ),
               child: Container(
                 // WCAG AAA touch target.
                 width: 44,
                 height: 44,
                 decoration: BoxDecoration(
-                  borderRadius:
-                      const BorderRadius.all(Radius.circular(AppRadius.md)),
+                  borderRadius: const BorderRadius.all(
+                    Radius.circular(AppRadius.md),
+                  ),
                   border: Border.all(
                     color: isActive ? activeColor : AppColors.hairline,
                   ),
