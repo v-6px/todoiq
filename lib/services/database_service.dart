@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import '../models/chat_message_model.dart';
 import '../models/saved_report.dart';
 import '../models/task_model.dart';
 
@@ -11,10 +12,12 @@ import '../models/task_model.dart';
 /// holds one lazily-opened [Database] handle for the life of the process.
 class DatabaseService {
   static const String _databaseName = 'task_master.db';
-  static const int _databaseVersion = 4;
+  static const int _databaseVersion = 7;
 
   static const String tasksTable = 'tasks';
+  static const String completionsTable = 'task_completions';
   static const String reportsTable = 'reports';
+  static const String chatMessagesTable = 'chat_messages';
 
   /// How many debriefs to keep per range.
   ///
@@ -75,6 +78,26 @@ class DatabaseService {
     );
 
     await _createReportsTable(db);
+    await _createChatMessagesTable(db);
+    await _createCompletionsTable(db);
+  }
+
+  /// One row per recurring task per day it was actioned.
+  ///
+  /// The primary key is what makes recording a status an upsert: tapping the
+  /// checkmark twice on the same day rewrites one row rather than piling up
+  /// history the day view then has to choose between.
+  Future<void> _createCompletionsTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE $completionsTable (
+        task_id INTEGER NOT NULL,
+        day INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        note TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (task_id, day)
+      )
+    ''');
   }
 
   /// Saved debriefs. Separate from tasks: a report is a snapshot of what the
@@ -93,6 +116,28 @@ class DatabaseService {
     await db.execute(
       'CREATE INDEX idx_reports_period ON $reportsTable '
       '(period_type, created_at DESC)',
+    );
+  }
+
+  /// The assistant conversation, so closing the screen does not lose it.
+  ///
+  /// Assistant turns are stored exactly as the model wrote them, task_action
+  /// block included, so reopening the screen restores the confirmation cards
+  /// along with the text.
+  Future<void> _createChatMessagesTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE $chatMessagesTable (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        action_added INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+
+    // Read in written order, every time.
+    await db.execute(
+      'CREATE INDEX idx_chat_created ON $chatMessagesTable (created_at)',
     );
   }
 
@@ -121,6 +166,66 @@ class DatabaseService {
       // Purely additive: existing installs gain an empty report history.
       await _createReportsTable(db);
     }
+    if (oldVersion < 5) {
+      // Creates the table at its current shape, action_added included — so
+      // the v6 step below must not also run, or it adds a column that is
+      // already there and takes the whole upgrade down with it. The `else`
+      // is load-bearing.
+      await _createChatMessagesTable(db);
+    } else if (oldVersion < 6) {
+      // A conversation stored before this column existed has no record of
+      // which proposals were accepted; defaulting to 0 offers them again,
+      // which is the safe direction to be wrong in.
+      await db.execute(
+        'ALTER TABLE $chatMessagesTable ADD COLUMN action_added '
+        'INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    if (oldVersion < 7) {
+      await _createCompletionsTable(db);
+      await _moveRecurringStatusIntoHistory(db);
+    }
+  }
+
+  /// Carries the one day a recurring row could remember into the history
+  /// table, then clears it off the row so there is a single source of truth.
+  Future<void> _moveRecurringStatusIntoHistory(Database db) async {
+    final List<Map<String, Object?>> rows = await db.query(
+      tasksTable,
+      where: 'recurrence_type != ? AND status_date IS NOT NULL',
+      whereArgs: <Object?>[RecurrenceType.none],
+    );
+
+    final Batch batch = db.batch();
+    for (final Map<String, Object?> row in rows) {
+      final String status = row['status'] as String;
+      final String? note = row['note'] as String?;
+      if (status == TaskStatus.pending && note == null) continue;
+
+      batch.insert(
+        completionsTable,
+        TaskCompletion(
+          taskId: row['id'] as int,
+          day: Task.dayKey(
+            DateTime.fromMillisecondsSinceEpoch(row['status_date'] as int),
+          ),
+          status: status,
+          note: note,
+        ).toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+    batch.update(
+      tasksTable,
+      <String, Object?>{
+        'status': TaskStatus.pending,
+        'note': null,
+        'status_date': null,
+      },
+      where: 'recurrence_type != ?',
+      whereArgs: <Object?>[RecurrenceType.none],
+    );
+    await batch.commit(noResult: true);
   }
 
   // --- CRUD ---------------------------------------------------------------
@@ -128,7 +233,23 @@ class DatabaseService {
   /// Inserts [task] and returns the row id SQLite assigned.
   Future<int> insertTask(Task task) async {
     final Database db = await database;
-    return db.insert(tasksTable, task.toMap());
+    return db.insert(tasksTable, _rowFor(task));
+  }
+
+  /// The stored shape of [task].
+  ///
+  /// A recurring task loaded for a day carries that day's status on the
+  /// object, which is right for display and wrong for the row: written back
+  /// by an edit or an undo it would stamp one day's outcome onto the whole
+  /// series. Per-day outcomes belong to [completionsTable] only.
+  static Map<String, Object?> _rowFor(Task task) {
+    final Map<String, Object?> row = task.toMap();
+    if (task.isRecurring) {
+      row['status'] = TaskStatus.pending;
+      row['note'] = null;
+      row['status_date'] = null;
+    }
+    return row;
   }
 
   /// Everything that belongs on the calendar day containing [date].
@@ -138,8 +259,8 @@ class DatabaseService {
   /// there are few of them, and weekday-set matching in SQL would mean string
   /// tricks on `repeat_days`.
   Future<List<Task>> getTasksForDate(DateTime date) async {
-    final DateTime start = DateTime(date.year, date.month, date.day);
-    final DateTime end = start.add(const Duration(days: 1));
+    final DateTime start = Task.dayStart(date);
+    final DateTime end = Task.addDays(start, 1);
     final Database db = await database;
 
     final List<Map<String, Object?>> oneOff = await db.query(
@@ -162,19 +283,79 @@ class DatabaseService {
       ],
     );
 
+    final List<Task> todays =
+        recurring.map(Task.fromMap).where((Task t) => t.occursOn(start)).toList();
+
     final List<Task> tasks = <Task>[
       ...oneOff.map(Task.fromMap),
-      ...recurring.map(Task.fromMap).where((Task t) => t.occursOn(start)),
+      ...await _withStatusOn(db, todays, start),
     ];
 
-    // Order by time of day, so a recurring task sits where it belongs in the
-    // timeline rather than by its original start date.
-    tasks.sort((Task a, Task b) {
-      final int byTime = _minutesOfDay(a).compareTo(_minutesOfDay(b));
-      if (byTime != 0) return byTime;
-      return (a.id ?? 0).compareTo(b.id ?? 0);
-    });
+    tasks.sort((Task a, Task b) => compareForDay(a, b, start));
     return tasks;
+  }
+
+  /// [recurring] as they stand on [day]: each carries that day's recorded
+  /// status and note, or pending with no note if nothing was recorded.
+  Future<List<Task>> _withStatusOn(
+    DatabaseExecutor db,
+    List<Task> recurring,
+    DateTime day,
+  ) async {
+    if (recurring.isEmpty) return recurring;
+
+    final List<int> ids = <int>[for (final Task t in recurring) t.id!];
+    final List<Map<String, Object?>> rows = await db.query(
+      completionsTable,
+      where: 'day = ? AND task_id IN (${List<String>.filled(ids.length, '?').join(',')})',
+      whereArgs: <Object?>[Task.dayKey(day), ...ids],
+    );
+    final Map<int, TaskCompletion> byTask = <int, TaskCompletion>{
+      for (final Map<String, Object?> row in rows)
+        row['task_id'] as int: TaskCompletion.fromMap(row),
+    };
+
+    return <Task>[
+      for (final Task task in recurring)
+        task.copyWith(
+          status: byTask[task.id]?.status ?? TaskStatus.pending,
+          note: byTask[task.id]?.note,
+          clearNote: byTask[task.id]?.note == null,
+          statusDate: Task.dayStart(day),
+        ),
+    ];
+  }
+
+  /// Task [id] as it stands on [day], or null if there is no such task.
+  ///
+  /// For a recurring task this carries that day's recorded status, which is
+  /// what alarm scheduling needs to know whether today's instance is done.
+  Future<Task?> getTaskOnDate(int id, DateTime day) async {
+    final Task? task = await getTaskById(id);
+    if (task == null || !task.isRecurring) return task;
+    final Database db = await database;
+    return (await _withStatusOn(db, <Task>[task], day)).single;
+  }
+
+  /// The order tasks appear in for [day].
+  ///
+  /// Finished work sinks; everything still open stays at the top where it can
+  /// be acted on. Within each group the order is time of day, so a recurring
+  /// task sits where it belongs in the timeline rather than by its original
+  /// start date. Only *completed* drops — partial and skipped are still worth
+  /// seeing in place, because they are what the day went wrong on and what
+  /// the debrief asks about.
+  ///
+  /// Public because the home screen re-sorts its own list the instant a
+  /// checkmark is tapped, and the two orders have to be the same one.
+  static int compareForDay(Task a, Task b, DateTime day) {
+    final bool aDone = a.statusOn(day) == TaskStatus.completed;
+    final bool bDone = b.statusOn(day) == TaskStatus.completed;
+    if (aDone != bDone) return aDone ? 1 : -1;
+
+    final int byTime = _minutesOfDay(a).compareTo(_minutesOfDay(b));
+    if (byTime != 0) return byTime;
+    return (a.id ?? 0).compareTo(b.id ?? 0);
   }
 
   static int _minutesOfDay(Task task) =>
@@ -190,10 +371,10 @@ class DatabaseService {
     DateTime end,
   ) async {
     final List<Task> occurrences = <Task>[];
-    DateTime day = DateTime(start.year, start.month, start.day);
-    final DateTime last = DateTime(end.year, end.month, end.day);
+    DateTime day = Task.dayStart(start);
+    final DateTime last = Task.dayStart(end);
 
-    while (day.isBefore(last)) {
+    for (; day.isBefore(last); day = Task.addDays(day, 1)) {
       for (final Task task in await getTasksForDate(day)) {
         occurrences.add(
           task.copyWith(
@@ -204,7 +385,6 @@ class DatabaseService {
           ),
         );
       }
-      day = day.add(const Duration(days: 1));
     }
     return occurrences;
   }
@@ -266,6 +446,42 @@ class DatabaseService {
         (note == null || note.trim().isEmpty) ? null : note.trim();
 
     final Database db = await database;
+
+    final List<Map<String, Object?>> found = await db.query(
+      tasksTable,
+      columns: <String>['recurrence_type'],
+      where: 'id = ?',
+      whereArgs: <Object?>[id],
+      limit: 1,
+    );
+    if (found.isEmpty) return 0;
+
+    // A recurring task's outcome is recorded against the one day it belongs
+    // to, in the history table. The series row is left alone, so nothing
+    // that later reloads, edits or re-arms the task can undo the checkmark.
+    if (found.single['recurrence_type'] != RecurrenceType.none) {
+      final int day = Task.dayKey(forDate ?? DateTime.now());
+      if (status == TaskStatus.pending && trimmed == null) {
+        await db.delete(
+          completionsTable,
+          where: 'task_id = ? AND day = ?',
+          whereArgs: <Object?>[id, day],
+        );
+      } else {
+        await db.insert(
+          completionsTable,
+          TaskCompletion(
+            taskId: id,
+            day: day,
+            status: status,
+            note: trimmed,
+          ).toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      return 1;
+    }
+
     final Map<String, Object?> values = <String, Object?>{
       'status': status,
       'note': trimmed,
@@ -292,15 +508,61 @@ class DatabaseService {
     final Database db = await database;
     return db.update(
       tasksTable,
-      task.toMap(),
+      _rowFor(task),
       where: 'id = ?',
       whereArgs: <Object?>[id],
     );
   }
 
+  /// Removes task [id] and its per-day history. Returns the task rows removed.
+  ///
+  /// One atomic batch — a single trip to the database, run as a transaction —
+  /// so a task can never survive with its history gone or the other way round.
   Future<int> deleteTask(int id) async {
     final Database db = await database;
-    return db.delete(tasksTable, where: 'id = ?', whereArgs: <Object?>[id]);
+    final Batch batch = db.batch()
+      ..rawDelete(
+        'DELETE FROM $completionsTable WHERE task_id = ?',
+        <Object?>[id],
+      )
+      ..rawDelete('DELETE FROM $tasksTable WHERE id = ?', <Object?>[id]);
+    final List<Object?> results = await batch.commit();
+    return results.last! as int;
+  }
+
+  /// Every day's recorded outcome for task [id].
+  ///
+  /// Read before a delete so an undo can put the history back as well.
+  Future<List<TaskCompletion>> getCompletionsForTask(int id) async {
+    final Database db = await database;
+    final List<Map<String, Object?>> rows = await db.query(
+      completionsTable,
+      where: 'task_id = ?',
+      whereArgs: <Object?>[id],
+    );
+    return rows.map(TaskCompletion.fromMap).toList();
+  }
+
+  /// Puts a deleted [task] back under its original id, with [completions].
+  Future<void> restoreTask(
+    Task task, {
+    List<TaskCompletion> completions = const <TaskCompletion>[],
+  }) async {
+    final Database db = await database;
+    await db.transaction((Transaction txn) async {
+      await txn.insert(
+        tasksTable,
+        _rowFor(task),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      for (final TaskCompletion completion in completions) {
+        await txn.insert(
+          completionsTable,
+          completion.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
   }
 
   /// Tasks that may still have a live alarm: every recurring task, plus
@@ -321,7 +583,19 @@ class DatabaseService {
         cutoff.millisecondsSinceEpoch,
       ],
     );
-    return rows.map(Task.fromMap).toList();
+    final List<Task> tasks = rows.map(Task.fromMap).toList();
+
+    // Recurring tasks carry today's outcome, so re-arming after a language
+    // switch does not bring back an alarm for an instance already finished.
+    final List<Task> recurring = await _withStatusOn(
+      db,
+      tasks.where((Task t) => t.isRecurring).toList(),
+      DateTime.now(),
+    );
+    return <Task>[
+      ...tasks.where((Task t) => !t.isRecurring),
+      ...recurring,
+    ];
   }
 
   /// Counts each status across every occurrence in `[start, end)`.
@@ -390,6 +664,44 @@ class DatabaseService {
       orderBy: 'created_at DESC, id DESC',
     );
     return rows.map(SavedReport.fromMap).toList();
+  }
+
+  // --- Assistant conversation ---------------------------------------------
+
+  /// Appends one turn. Returns the row id SQLite assigned.
+  Future<int> insertChatMessage(ChatMessage message) async {
+    final Database db = await database;
+    return db.insert(chatMessagesTable, message.toMap());
+  }
+
+  /// The whole conversation, oldest first — the order it is rendered in.
+  Future<List<ChatMessage>> getChatMessages() async {
+    final Database db = await database;
+    final List<Map<String, Object?>> rows = await db.query(
+      chatMessagesTable,
+      orderBy: 'created_at ASC, id ASC',
+    );
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Records that the task turn [id] proposed has been added.
+  ///
+  /// What stops a restored proposal card creating the same task on every
+  /// visit to the screen.
+  Future<int> markChatActionAdded(int id) async {
+    final Database db = await database;
+    return db.update(
+      chatMessagesTable,
+      <String, Object?>{'action_added': 1},
+      where: 'id = ?',
+      whereArgs: <Object?>[id],
+    );
+  }
+
+  /// Deletes the conversation. Returns how many turns went.
+  Future<int> clearChatMessages() async {
+    final Database db = await database;
+    return db.delete(chatMessagesTable);
   }
 
   /// Closes the handle so the next access reopens it. Mainly for tests.

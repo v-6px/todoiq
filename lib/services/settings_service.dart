@@ -3,6 +3,8 @@ import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../l10n/app_strings.dart';
+
 /// A named BYOK provider configuration offered in the settings screen.
 class ProviderPreset {
   final String label;
@@ -34,7 +36,10 @@ class SettingsService {
   /// Used when the device locale is neither English nor Arabic.
   static const String fallbackLanguageCode = 'ar';
 
-  static const List<String> supportedLanguageCodes = <String>['en', 'ar'];
+  /// Mirrors [AppStrings.supportedLanguageCodes]; a language the strings do
+  /// not carry must never be storable.
+  static const List<String> supportedLanguageCodes =
+      AppStrings.supportedLanguageCodes;
 
   /// Presets for the settings dropdown. All are OpenAI-compatible endpoints.
   static const List<ProviderPreset> presets = <ProviderPreset>[

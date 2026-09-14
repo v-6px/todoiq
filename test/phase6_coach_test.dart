@@ -12,11 +12,13 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:todo_list/l10n/app_strings.dart';
 import 'package:todo_list/models/chat_message_model.dart';
 import 'package:todo_list/models/task_action.dart';
 import 'package:todo_list/models/task_model.dart';
 import 'package:todo_list/screens/chat_coach_screen.dart';
 import 'package:todo_list/screens/settings_screen.dart';
+import 'package:todo_list/services/ai_service.dart';
 import 'package:todo_list/services/database_service.dart';
 import 'package:todo_list/services/notification_service.dart';
 import 'package:todo_list/services/settings_service.dart';
@@ -89,6 +91,7 @@ void main() {
 
     final Database database = await DatabaseService.instance.database;
     await database.delete(DatabaseService.tasksTable);
+    await database.delete(DatabaseService.chatMessagesTable);
   });
 
   tearDown(() {
@@ -161,7 +164,11 @@ void main() {
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.forLocale(Locale(language)),
       locale: Locale(language),
-      supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+      supportedLocales: const <Locale>[
+        Locale('en'),
+        Locale('ar'),
+        Locale('fr'),
+      ],
       localizationsDelegates: const <LocalizationsDelegate<Object>>[
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -321,7 +328,7 @@ void main() {
 
       expect(find.byKey(ChatCoachScreen.inputKey), findsOneWidget);
       expect(find.byKey(ChatCoachScreen.sendKey), findsOneWidget);
-      expect(find.textContaining('Your coach has today'), findsOneWidget);
+      expect(find.textContaining('Your assistant has today'), findsOneWidget);
       expect(requests, isEmpty, reason: 'no call before the user speaks');
     });
 
@@ -429,8 +436,12 @@ void main() {
       );
 
       await ask(tester, 'First try');
-      expect(find.textContaining('API key was rejected'), findsOneWidget);
-      expect(find.textContaining('Bad key'), findsOneWidget);
+      expect(
+        find.text(AppStrings.en.aiFailure(AiFailure.unauthorized)),
+        findsOneWidget,
+      );
+      // The provider's body stays in the log, never in the bubble.
+      expect(find.textContaining('Bad key'), findsNothing);
 
       await ask(tester, 'Second try');
 
@@ -459,10 +470,59 @@ void main() {
       await ask(tester, 'Anything there?');
 
       expect(
-        find.textContaining('Could not reach the endpoint'),
+        find.text(AppStrings.en.aiFailure(AiFailure.network)),
         findsOneWidget,
       );
       expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('an Arabic session gets an Arabic message, not JSON', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(
+        tester,
+        language: 'ar',
+        client: MockClient((http.Request request) async {
+          requests.add(request);
+          return http.Response(
+            jsonEncode(<String, Object?>{
+              'error': <String, Object?>{
+                'code': 400,
+                'message': 'Invalid JSON payload received.',
+                'status': 'INVALID_ARGUMENT',
+              },
+            }),
+            400,
+          );
+        }),
+      );
+
+      await ask(tester, 'ساعدني');
+
+      expect(find.text(AppStrings.ar.coachGenericError), findsOneWidget);
+      expect(find.textContaining('INVALID_ARGUMENT'), findsNothing);
+      expect(find.textContaining('{'), findsNothing);
+    });
+
+    testWidgets('a rate limit is explained in Arabic', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(
+        tester,
+        language: 'ar',
+        client: MockClient((http.Request request) async {
+          requests.add(request);
+          return http.Response('{"error":{"message":"quota"}}', 429);
+        }),
+      );
+
+      await ask(tester, 'ساعدني');
+
+      expect(
+        find.text(AppStrings.ar.aiFailure(AiFailure.rateLimited)),
+        findsOneWidget,
+      );
+      expect(find.textContaining('quota'), findsNothing);
     });
 
     testWidgets('missing credentials offer a Settings shortcut', (
@@ -474,7 +534,10 @@ void main() {
       await ask(tester, 'Coach me');
 
       expect(requests, isEmpty, reason: 'never call without a key');
-      expect(find.textContaining('Add an API key in Settings'), findsOneWidget);
+      expect(
+        find.text(AppStrings.en.aiFailure(AiFailure.missingConfiguration)),
+        findsOneWidget,
+      );
 
       await tester.tap(find.byKey(ChatCoachScreen.settingsShortcutKey));
       await settle(tester);
@@ -499,6 +562,310 @@ void main() {
 
   String withAction(String prose, String json) =>
       '$prose\n\n```task_action\n$json\n```';
+
+  // ---- Conversation history ---------------------------------------------
+
+  group('Chat persistence', () {
+    Future<List<ChatMessage>> storedTurns(WidgetTester tester) =>
+        onDb(tester, () => DatabaseService.instance.getChatMessages());
+
+    testWidgets('both sides of an exchange are written down', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester, client: replyWith('Rest tonight.'));
+      await ask(tester, 'What now?');
+
+      final List<ChatMessage> stored = await storedTurns(tester);
+      expect(stored, hasLength(2));
+      expect(stored.first.role, ChatRole.user);
+      expect(stored.first.content, 'What now?');
+      expect(stored.last.role, ChatRole.assistant);
+      expect(stored.last.content, 'Rest tonight.');
+    });
+
+    testWidgets('an assistant turn is stored raw, block and all', (
+      WidgetTester tester,
+    ) async {
+      final String reply = withAction(
+        'Noted.',
+        '{"title": "Call the bank", "date": "2036-09-11", "time": "10:00"}',
+      );
+      await pumpCoach(tester, client: replyWith(reply));
+      await ask(tester, 'Remind me to call the bank');
+
+      final List<ChatMessage> stored = await storedTurns(tester);
+      expect(
+        stored.last.content,
+        reply,
+        reason: 'stripping here would lose the proposal on the next launch',
+      );
+    });
+
+    testWidgets('the conversation comes back when the screen reopens', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester, client: replyWith('Rest tonight.'));
+      await ask(tester, 'What now?');
+
+      // A second screen, as if the app had been closed and reopened.
+      await pumpCoach(tester);
+
+      expect(find.text('What now?'), findsOneWidget);
+      expect(find.textContaining('Rest tonight.'), findsOneWidget);
+      expect(find.text(AppStrings.en.coachEmptyTitle), findsNothing);
+    });
+
+    testWidgets('a restored reply shows its card, not its JSON', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(
+        tester,
+        client: replyWith(withAction(
+          'Noted.',
+          '{"title": "Call the bank", "date": "2036-09-11", "time": "10:00"}',
+        )),
+      );
+      await ask(tester, 'Remind me to call the bank');
+
+      await pumpCoach(tester);
+
+      expect(find.textContaining('task_action'), findsNothing);
+      expect(find.text('Call the bank'), findsOneWidget);
+      expect(find.byKey(ChatCoachScreen.taskActionKey(1)), findsOneWidget);
+    });
+
+    testWidgets('a restored card still adds the task when tapped', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(
+        tester,
+        client: replyWith(withAction(
+          'Noted.',
+          '{"title": "Call the bank", "date": "2036-09-11", "time": "10:00"}',
+        )),
+      );
+      await ask(tester, 'Remind me to call the bank');
+      await pumpCoach(tester);
+
+      await tester.tap(find.byKey(ChatCoachScreen.taskActionAddKey(1)));
+      await settle(tester);
+
+      final List<Task> saved = await onDb(
+        tester,
+        () => DatabaseService.instance.getTasksBetween(
+          DateTime(2036, 9, 1),
+          DateTime(2036, 10, 1),
+        ),
+      );
+      expect(saved.single.title, 'Call the bank');
+    });
+
+    testWidgets('a failed turn is not written to the history', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(
+        tester,
+        client: MockClient((http.Request request) async {
+          requests.add(request);
+          return http.Response('{"error":{"message":"boom"}}', 500);
+        }),
+      );
+      await ask(tester, 'Coach me');
+
+      final List<ChatMessage> stored = await storedTurns(tester);
+      expect(
+        stored.map((ChatMessage m) => m.role),
+        <String>[ChatRole.user],
+        reason: 'the question was asked; the error is UI state',
+      );
+    });
+
+    testWidgets('history is replayed into the next request', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester, client: replyWith('Rest tonight.'));
+      await ask(tester, 'What now?');
+
+      await pumpCoach(tester, client: replyWith('Still rest.'));
+      await ask(tester, 'And tomorrow?');
+
+      final Map<String, Object?> body =
+          jsonDecode(requests.last.body) as Map<String, Object?>;
+      final List<String> contents = (body['messages']! as List<Object?>)
+          .cast<Map<Object?, Object?>>()
+          .map((Map<Object?, Object?> m) => m['content']! as String)
+          .toList();
+
+      expect(contents, contains('What now?'));
+      expect(contents, contains('Rest tonight.'));
+      expect(contents.last, 'And tomorrow?');
+    });
+  });
+
+  group('A proposal is only accepted once', () {
+    /// Replies with a task proposal, confirms it, and returns the tasks saved.
+    Future<List<Task>> savedTasks(WidgetTester tester) => onDb(
+          tester,
+          () => DatabaseService.instance.getTasksBetween(
+            DateTime(2036, 9, 1),
+            DateTime(2036, 10, 1),
+          ),
+        );
+
+    Future<void> proposeAndConfirm(WidgetTester tester) async {
+      await pumpCoach(
+        tester,
+        client: replyWith(withAction(
+          'Noted.',
+          '{"title": "Call the bank", "date": "2036-09-11", "time": "10:00"}',
+        )),
+      );
+      await ask(tester, 'Remind me to call the bank');
+
+      await tester.tap(find.byKey(ChatCoachScreen.taskActionAddKey(1)));
+      await settle(tester);
+    }
+
+    testWidgets('confirming is recorded against the stored turn', (
+      WidgetTester tester,
+    ) async {
+      await proposeAndConfirm(tester);
+
+      final List<ChatMessage> stored = await onDb(
+        tester,
+        () => DatabaseService.instance.getChatMessages(),
+      );
+      expect(stored.last.role, ChatRole.assistant);
+      expect(stored.last.actionAdded, isTrue);
+      expect(stored.first.actionAdded, isFalse, reason: 'the question');
+    });
+
+    testWidgets('a confirmed card comes back as a receipt, not a button', (
+      WidgetTester tester,
+    ) async {
+      await proposeAndConfirm(tester);
+      expect(await savedTasks(tester), hasLength(1));
+
+      // Reopen, as if the app had been closed and come back.
+      await pumpCoach(tester);
+
+      // The card is still there — it is part of the conversation — but it no
+      // longer offers to do anything.
+      expect(find.byKey(ChatCoachScreen.taskActionKey(1)), findsOneWidget);
+      expect(find.text('Call the bank'), findsOneWidget);
+      expect(find.textContaining('Add Task to Schedule'), findsNothing);
+      // Scoped to the card: the confirmation snackbar carries the same
+      // sentence and may still be on screen.
+      expect(
+        find.descendant(
+          of: find.byKey(ChatCoachScreen.taskActionKey(1)),
+          matching: find.textContaining('Task added to your schedule.'),
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('reopening and tapping cannot create the task twice', (
+      WidgetTester tester,
+    ) async {
+      await proposeAndConfirm(tester);
+      await pumpCoach(tester);
+
+      // The key still resolves — it is the receipt row — so tapping it is
+      // exactly what a user retracing their steps would do.
+      await tester.tap(
+        find.byKey(ChatCoachScreen.taskActionAddKey(1)),
+        warnIfMissed: false,
+      );
+      await settle(tester);
+
+      expect(
+        await savedTasks(tester),
+        hasLength(1),
+        reason: 'the flag is what stops a second copy',
+      );
+    });
+
+    testWidgets('an unconfirmed proposal still offers itself after reopening',
+        (WidgetTester tester) async {
+      await pumpCoach(
+        tester,
+        client: replyWith(withAction(
+          'Noted.',
+          '{"title": "Call the bank", "date": "2036-09-11", "time": "10:00"}',
+        )),
+      );
+      await ask(tester, 'Remind me to call the bank');
+
+      // Closed without confirming.
+      await pumpCoach(tester);
+
+      expect(find.textContaining('Add Task to Schedule'), findsOneWidget);
+      expect(await savedTasks(tester), isEmpty);
+
+      await tester.tap(find.byKey(ChatCoachScreen.taskActionAddKey(1)));
+      await settle(tester);
+      expect(await savedTasks(tester), hasLength(1));
+    });
+  });
+
+  group('Clearing the conversation', () {
+    testWidgets('the menu only appears once there is something to clear', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester);
+      expect(find.byKey(ChatCoachScreen.menuKey), findsNothing);
+
+      await ask(tester, 'What now?');
+      expect(find.byKey(ChatCoachScreen.menuKey), findsOneWidget);
+    });
+
+    testWidgets('clearing empties the screen and the database', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester, client: replyWith('Rest tonight.'));
+      await ask(tester, 'What now?');
+
+      await tester.tap(find.byKey(ChatCoachScreen.menuKey));
+      await settle(tester);
+      await tester.tap(find.byKey(ChatCoachScreen.clearChatKey));
+      await settle(tester);
+
+      expect(find.text('What now?'), findsNothing);
+      expect(find.text(AppStrings.en.coachEmptyTitle), findsOneWidget);
+      expect(find.text('Conversation cleared.'), findsWidgets);
+
+      expect(
+        await onDb(tester, () => DatabaseService.instance.getChatMessages()),
+        isEmpty,
+      );
+    });
+
+    testWidgets('a cleared conversation stays cleared after reopening', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester, client: replyWith('Rest tonight.'));
+      await ask(tester, 'What now?');
+
+      await tester.tap(find.byKey(ChatCoachScreen.menuKey));
+      await settle(tester);
+      await tester.tap(find.byKey(ChatCoachScreen.clearChatKey));
+      await settle(tester);
+
+      await pumpCoach(tester);
+      expect(find.text(AppStrings.en.coachEmptyTitle), findsOneWidget);
+    });
+
+    testWidgets('the menu is translated', (WidgetTester tester) async {
+      await pumpCoach(tester, language: 'ar', client: replyWith('تمام.'));
+      await ask(tester, 'ماذا الآن؟');
+
+      await tester.tap(find.byKey(ChatCoachScreen.menuKey));
+      await settle(tester);
+
+      expect(find.text('مسح المحادثة'), findsOneWidget);
+    });
+  });
 
   group('CoachReply parsing', () {
     test('splits the prose from the action block', () {
@@ -641,9 +1008,44 @@ void main() {
 
       // A rule stated as a requirement, plus one worked example — models
       // drop an optional-sounding format far more often than a mandatory one.
-      expect(prompt, contains('MUST append exactly one block'));
+      expect(prompt, contains('hard requirement'));
+      expect(prompt, contains('highest-priority intent'));
       expect(prompt, contains('Worked example'));
       expect(prompt, contains('"title": "Call the bank"'));
+
+      // Arabic and French trigger words, so the intent is recognised in the
+      // language the user is actually typing in.
+      expect(prompt, contains('أضف مهمة'));
+      expect(prompt, contains('سجل'));
+      expect(prompt, contains('جدول'));
+      expect(prompt, contains('rappelle-moi'));
+    });
+
+    testWidgets('scheduling is told to outrank reviewing the day', (
+      WidgetTester tester,
+    ) async {
+      await pumpCoach(tester);
+      await ask(tester, 'Hi');
+
+      final String prompt = systemTurn();
+
+      // The failure this replaces: asked to add a task, the coach would
+      // start discussing yesterday and never write the block.
+      expect(prompt, contains('it outranks every other instruction'));
+      expect(prompt, contains('do not review their day'));
+      expect(prompt, contains('Drifting into analysis'));
+
+      // The scheduling contract comes before the task log, not after it.
+      expect(
+        prompt.indexOf('TASK SCHEDULING'),
+        lessThan(prompt.indexOf('Their task log for')),
+      );
+
+      // And reflecting on the day is explicitly the other branch.
+      expect(
+        prompt,
+        contains('When they are NOT asking for something to be scheduled'),
+      );
     });
 
     testWidgets('a proposed task is offered as a card, not as raw JSON', (

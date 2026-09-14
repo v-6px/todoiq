@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The notification icon is named only as a string from Dart
+     (NotificationService.androidIcon), which resource shrinking cannot see.
+     Without this it may be stripped from a release build, and the OS then
+     drops every notification that asks for it. -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@mipmap/ic_launcher,@drawable/ic_launcher_*" />

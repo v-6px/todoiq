@@ -12,6 +12,7 @@ import '../models/saved_report.dart';
 import '../models/task_model.dart';
 import '../services/ai_service.dart';
 import '../services/database_service.dart';
+import '../services/debrief_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/stat_chip.dart';
 import 'settings_screen.dart';
@@ -48,98 +49,12 @@ class ReportScreen extends StatefulWidget {
 
   const ReportScreen({super.key, this.now, this.client});
 
-  static String systemPrompt(AppStrings strings) =>
-      'You are a concise productivity coach reviewing a task log. '
-      'Write in Markdown. Be specific and reference the actual task titles. '
-      'Never invent tasks that are not in the log. '
-      'Aim for 250-400 words: concise, but a finished piece of writing. '
-      'Every section named below must be present and must end on a complete '
-      'sentence — never stop mid-sentence, and never leave a section empty '
-      'or unwritten because you are running long. If you are running out of '
-      'room, write less in each section rather than dropping one. '
-      '${strings.replyLanguageInstruction}';
-
-  /// Builds the user turn: the log, plus what to do with it.
-  ///
-  /// Tasks are grouped by status so the distinction the app is built around —
-  /// partial means real progress, skipped means it never started — survives
-  /// into the prompt.
-  static String buildDebriefPrompt(
-    ReportRange range,
-    List<Task> tasks,
-    DateTime now, {
-    AppStrings strings = AppStrings.en,
-  }) {
-    // The log itself stays in English so the model reads a stable format; the
-    // reply language is set by the system turn.
-    final DateFormat dayFormat = DateFormat('EEE d MMM', 'en');
-    final DateFormat timeFormat = DateFormat.Hm('en');
-
-    String section(String heading, String status) {
-      final List<Task> matching =
-          tasks.where((Task t) => t.status == status).toList();
-      if (matching.isEmpty) return '$heading: none\n';
-
-      final StringBuffer buffer = StringBuffer('$heading:\n');
-      for (final Task task in matching) {
-        buffer.write(
-          '- "${task.title}" scheduled ${dayFormat.format(task.scheduledTime)} '
-          'at ${timeFormat.format(task.scheduledTime)}',
-        );
-        // The note is the user's own account of what went wrong — the most
-        // valuable signal in the whole log.
-        if (task.hasNote) {
-          buffer.write('; their reason: "${task.note!.trim()}"');
-        }
-        buffer.writeln();
-      }
-      return buffer.toString();
-    }
-
-    final StringBuffer prompt = StringBuffer()
-      ..writeln('Task log for: ${range.englishLabel.toLowerCase()} '
-          '(${range.dayCount(now)} day(s), ending ${dayFormat.format(now)}).')
-      ..writeln()
-      ..writeln(section('COMPLETED (finished)', TaskStatus.completed))
-      ..writeln(section('PARTIAL (progress made, not finished)',
-          TaskStatus.partial))
-      ..writeln(section('SKIPPED (never started or postponed)',
-          TaskStatus.skipped))
-      ..writeln(section('STILL PENDING (not yet actioned)',
-          TaskStatus.pending))
-      ..writeln()
-      ..writeln('Write the debrief with these Markdown sections, using these '
-          'headings exactly as written — they are already in the language '
-          'you are replying in, so copy them verbatim and do not translate '
-          'or re-word them:')
-      ..writeln('## ${strings.reportHeadingSummary}')
-      ..writeln('Two sentences on how the period went, contrasting what was '
-          'completed against what was only partial or skipped.')
-      ..writeln('## ${strings.reportHeadingBottlenecks}')
-      ..writeln('Identify what is blocking the PARTIAL tasks specifically — '
-          'why work starts but does not finish. Where a reason is quoted, '
-          'treat it as the primary evidence and build on it rather than '
-          'speculating. Look for patterns in the timing and the kind of '
-          'work. If the evidence is thin, say so rather than guessing.')
-      ..writeln('## ${strings.reportHeadingNextSteps}')
-      ..writeln('Two or three concrete steps to take tomorrow, each tied to a '
-          'task above. No generic advice.')
-      ..writeln()
-      ..writeln('Write flowing prose in your reply language. Task titles are '
-          'quoted from the log and stay exactly as they are spelled, even '
-          'when the rest of the sentence is in another script.')
-      ..writeln('Write all three sections, in this order, and finish the '
-          'last one properly — a debrief that stops part-way is worse than a '
-          'short one.');
-
-    return prompt.toString();
-  }
-
   @override
   State<ReportScreen> createState() => _ReportScreenState();
 }
 
-class _ReportScreenState extends State<ReportScreen> {
+class _ReportScreenState extends State<ReportScreen>
+    with WidgetsBindingObserver {
   late final AiService _ai = AiService(client: widget.client);
 
   ReportRange _range = ReportRange.today;
@@ -159,21 +74,38 @@ class _ReportScreenState extends State<ReportScreen> {
   String? _error;
   bool _errorIsConfiguration = false;
 
-  DateTime get _now => widget.now ?? DateTime.now();
+  DateTime get _now => (widget.now ?? DateTime.now()).toLocal();
+
+  /// The local day the counts on screen were read for.
+  DateTime? _countsDay;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadCounts();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ai.dispose();
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Left open across midnight, "Today" would still be counting yesterday.
+    if (state == AppLifecycleState.resumed &&
+        _countsDay != null &&
+        Task.dayStart(_now) != _countsDay &&
+        !_generating) {
+      _loadCounts();
+    }
+  }
+
   Future<void> _loadCounts() async {
+    _countsDay = Task.dayStart(_now);
     final Map<String, int> counts =
         await DatabaseService.instance.getStatusCounts(
       _range.start(_now),
@@ -228,9 +160,9 @@ class _ReportScreenState extends State<ReportScreen> {
 
       final String reply = await _ai.complete(
         <AiMessage>[
-          AiMessage.system(ReportScreen.systemPrompt(strings)),
+          AiMessage.system(DebriefService.systemPrompt(strings)),
           AiMessage.user(
-            ReportScreen.buildDebriefPrompt(
+            DebriefService.buildPrompt(
               _range,
               tasks,
               _now,
@@ -240,6 +172,9 @@ class _ReportScreenState extends State<ReportScreen> {
         ],
         maxTokens: AiService.debriefMaxTokens,
         temperature: 0.7,
+        // A report cut off at the ceiling is finished rather than saved
+        // half-written.
+        continueIfTruncated: true,
       );
 
       // Stored exactly as written, before any rendering is applied to it.
@@ -256,9 +191,13 @@ class _ReportScreenState extends State<ReportScreen> {
         _generating = false;
       });
     } on AiException catch (error) {
+      // The technical detail — status, provider body — goes to the log. The
+      // screen gets one plain sentence in the user's language, never JSON.
+      debugPrint('ReportScreen: debrief failed (${error.kind}): '
+          '${error.message}');
       if (!mounted) return;
       setState(() {
-        _error = error.message;
+        _error = strings.aiFailure(error.kind);
         _errorIsConfiguration = error.isConfigurationError;
         _generating = false;
       });

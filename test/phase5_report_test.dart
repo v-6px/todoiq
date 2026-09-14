@@ -19,6 +19,7 @@ import 'package:todo_list/screens/report_screen.dart';
 import 'package:todo_list/screens/settings_screen.dart';
 import 'package:todo_list/services/ai_service.dart';
 import 'package:todo_list/services/database_service.dart';
+import 'package:todo_list/services/debrief_service.dart';
 import 'package:todo_list/services/settings_service.dart';
 import 'package:todo_list/theme/app_theme.dart';
 import 'package:todo_list/widgets/stat_chip.dart';
@@ -131,7 +132,11 @@ void main() {
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.forLocale(Locale(language)),
       locale: Locale(language),
-      supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+      supportedLocales: const <Locale>[
+        Locale('en'),
+        Locale('ar'),
+        Locale('fr'),
+      ],
       localizationsDelegates: const <LocalizationsDelegate<Object>>[
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -251,7 +256,7 @@ void main() {
         ];
 
     test('groups tasks under their status with titles and times', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         sample(),
         kNow,
@@ -268,37 +273,76 @@ void main() {
       expect(prompt, contains('14:00'));
     });
 
-    test('asks for obstacles behind partial tasks and concrete next steps',
-        () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+    test('asks for the three sections, in order, with their marks', () {
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         sample(),
         kNow,
       );
 
-      expect(prompt, contains('## Obstacles'));
+      final int summary =
+          prompt.indexOf('### ${DebriefService.summaryMark}');
+      final int obstacles =
+          prompt.indexOf('### ${DebriefService.obstaclesMark}');
+      final int plan = prompt.indexOf('### ${DebriefService.planMark}');
+
+      expect(summary, greaterThan(-1));
+      expect(obstacles, greaterThan(summary), reason: 'order is part of it');
+      expect(plan, greaterThan(obstacles));
+
+      expect(prompt, contains(AppStrings.en.reportHeadingSummary));
+      expect(prompt, contains(AppStrings.en.reportHeadingBottlenecks));
+      expect(prompt, contains(AppStrings.en.reportHeadingNextSteps));
       expect(prompt, contains('PARTIAL tasks specifically'));
-      expect(prompt, contains('## Tomorrow\u2019s steps'));
-      expect(prompt, contains('tied to a task above'));
+    });
+
+    test('demands analysis rather than encouragement', () {
+      // The point of the rewrite: a debrief that opens with praise is worth
+      // nothing to somebody looking at three skipped tasks.
+      final String system = DebriefService.systemPrompt(AppStrings.en);
+
+      expect(system, contains('high-accountability'));
+      expect(system, contains('analytical, direct and unsentimental'));
+      expect(system, contains('do not open with praise'));
+      expect(system, contains('No greetings, no encouragement'));
+
+      final String prompt = DebriefService.buildPrompt(
+        ReportRange.today,
+        sample(),
+        kNow,
+      );
+      expect(prompt, contains('No compliments, no hedging'));
+      expect(prompt, contains('No general advice, no motivational'));
+    });
+
+    test('hands the model the totals and the date, not just the log', () {
+      final String prompt = DebriefService.buildPrompt(
+        ReportRange.today,
+        sample(),
+        kNow,
+      );
+
+      expect(prompt, contains('Today is 2026-09-09.'));
+      expect(prompt, contains('Totals: '));
     });
 
     test('insists on a finished debrief rather than a truncated one', () {
       // Running out of room is the failure users actually see: the report
       // stops mid-sentence. Both turns of the prompt have to rule it out.
-      final String system = ReportScreen.systemPrompt(AppStrings.en);
-      expect(system, contains('never stop mid-sentence'));
-      expect(system, contains('250-400 words'));
+      final String system = DebriefService.systemPrompt(AppStrings.en);
+      expect(system, contains('never stopping mid-thought'));
+      expect(system, contains('200-350 words'));
 
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         sample(),
         kNow,
       );
-      expect(prompt, contains('Write all three sections'));
+      expect(prompt, contains('Finish the last section properly'));
     });
 
     test('marks an absent status as none rather than omitting it', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         <Task>[
           Task(
@@ -315,7 +359,7 @@ void main() {
     });
 
     test('quotes the note beside the task it belongs to', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         <Task>[
           Task(
@@ -343,16 +387,18 @@ void main() {
     });
 
     test('tells the model to treat quoted reasons as primary evidence', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
-        ReportRange.today,
-        <Task>[],
-        kNow,
+      expect(
+        DebriefService.systemPrompt(AppStrings.en),
+        contains('that reason is evidence'),
       );
-      expect(prompt, contains('treat it as the primary evidence'));
+      expect(
+        DebriefService.buildPrompt(ReportRange.today, <Task>[], kNow),
+        contains('working from the reasons quoted in the log above'),
+      );
     });
 
     test('names the range and its length', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.thisWeek,
         sample(),
         kNow,
@@ -422,6 +468,50 @@ void main() {
       expect(box.bottom, lessThanOrEqualTo(screen.height));
     });
 
+    testWidgets('a reply is read whole, however long', (
+      WidgetTester tester,
+    ) async {
+      // 12k characters of debrief: nothing on this side may shorten it.
+      final String huge = List<String>.generate(
+        200,
+        (int i) => 'Sentence $i of a very long debrief that keeps going.',
+      ).join(' ');
+
+      await seed(tester, 'Done', DateTime(2026, 9, 9, 9), TaskStatus.completed);
+      await pumpReport(tester, client: replyWith(huge));
+
+      await tester.tap(find.byKey(ReportScreen.generateKey));
+      await settle(tester);
+
+      final SavedReport? stored = await onDb(
+        tester,
+        () => DatabaseService.instance.getLatestReport(ReportRange.today.name),
+      );
+      expect(stored!.contentMarkdown.length, huge.length);
+      expect(stored.contentMarkdown, huge);
+    });
+
+    test('a provider that stopped at its ceiling is noticed', () {
+      // finish_reason "length" is the provider saying the text ends early.
+      // Nothing throws — it is a log line, not a failure — but the parse has
+      // to survive every shape of body.
+      AiService.warnIfTruncated(jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'finish_reason': 'length',
+            'message': <String, String>{'content': 'cut off here'},
+          },
+        ],
+      }));
+      AiService.warnIfTruncated('not json at all');
+      AiService.warnIfTruncated('{}');
+      AiService.warnIfTruncated(jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{'finish_reason': 'stop'},
+        ],
+      }));
+    });
+
     testWidgets('the debrief asks for a budget that fits a full report', (
       WidgetTester tester,
     ) async {
@@ -435,8 +525,14 @@ void main() {
       // costs markedly more tokens per word than English.
       final Map<String, Object?> body =
           jsonDecode(requests.single.body) as Map<String, Object?>;
-      expect(body['max_tokens'], AiService.debriefMaxTokens);
-      expect(AiService.debriefMaxTokens, greaterThanOrEqualTo(1500));
+      expect(body['max_tokens'], AiService.defaultMaxTokens);
+      // 2048 still cut debriefs off: thinking models spend part of it on
+      // hidden reasoning before writing a word of the report.
+      expect(AiService.defaultMaxTokens, 8192);
+
+      // max_completion_tokens was sent alongside for a while; Gemini's
+      // compatibility layer rejects the unknown field with a 400.
+      expect(body.containsKey('max_completion_tokens'), isFalse);
     });
   });
 
@@ -709,7 +805,7 @@ void main() {
       expect(request.headers['User-Agent'], AiService.userAgent);
     });
 
-    testWidgets('surfaces a rejected key with the provider message', (
+    testWidgets('explains a rejected key plainly, without the raw body', (
       WidgetTester tester,
     ) async {
       await seed(tester, 'Done', DateTime(2026, 9, 9, 9),
@@ -723,8 +819,13 @@ void main() {
       await settle(tester);
 
       expect(find.byKey(ReportScreen.errorKey), findsOneWidget);
-      expect(find.textContaining('API key was rejected'), findsOneWidget);
-      expect(find.textContaining('Bad key'), findsOneWidget);
+      expect(
+        find.text(AppStrings.en.aiFailure(AiFailure.unauthorized)),
+        findsOneWidget,
+      );
+      // The provider's JSON stays in the log, never on screen.
+      expect(find.textContaining('Bad key'), findsNothing);
+      expect(find.textContaining('{'), findsNothing);
       expect(find.byKey(ReportScreen.markdownKey), findsNothing);
     });
 
@@ -743,7 +844,7 @@ void main() {
       await tester.tap(find.byKey(ReportScreen.generateKey));
       await settle(tester);
 
-      expect(find.textContaining('Could not reach the endpoint'),
+      expect(find.text(AppStrings.en.aiFailure(AiFailure.network)),
           findsOneWidget);
       expect(tester.takeException(), isNull);
     });
@@ -763,7 +864,8 @@ void main() {
       await tester.tap(find.byKey(ReportScreen.generateKey));
       await settle(tester);
 
-      expect(find.textContaining('empty response'), findsOneWidget);
+      expect(find.text(AppStrings.en.aiFailure(AiFailure.emptyResponse)),
+          findsOneWidget);
       expect(find.byKey(ReportScreen.markdownKey), findsNothing);
     });
 
@@ -780,7 +882,10 @@ void main() {
 
       // No request should ever leave without a key.
       expect(requests, isEmpty);
-      expect(find.textContaining('Add an API key in Settings'), findsOneWidget);
+      expect(
+        find.text(AppStrings.en.aiFailure(AiFailure.missingConfiguration)),
+        findsOneWidget,
+      );
 
       await tester.tap(find.byKey(ReportScreen.settingsShortcutKey));
       await settle(tester);
@@ -1054,30 +1159,30 @@ void main() {
     });
 
     test('the prompt asks for Arabic headings when replying in Arabic', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         <Task>[],
         kNow,
         strings: AppStrings.ar,
       );
 
-      expect(prompt, contains('## الملخص'));
-      expect(prompt, contains('## المعوقات'));
-      expect(prompt, contains('## خطوات الغد'));
-      expect(prompt, isNot(contains('## Summary')));
-      expect(prompt, isNot(contains('## Obstacles')));
+      expect(prompt, contains('### 📊 خلاصة الإنجاز'));
+      expect(prompt, contains('### ❌ نقاط التعثر والخلل'));
+      expect(prompt, contains('### 🎯 خطة الضبط لليوم القادم'));
+      expect(prompt, isNot(contains('Completion summary')));
+      expect(prompt, isNot(contains('Where it broke down')));
     });
 
     test('the English prompt keeps the English headings', () {
-      final String prompt = ReportScreen.buildDebriefPrompt(
+      final String prompt = DebriefService.buildPrompt(
         ReportRange.today,
         <Task>[],
         kNow,
       );
 
-      expect(prompt, contains('## Summary'));
-      expect(prompt, contains('## Obstacles'));
-      expect(prompt, contains('## Tomorrow\u2019s steps'));
+      expect(prompt, contains('### 📊 Completion summary'));
+      expect(prompt, contains('### ❌ Where it broke down'));
+      expect(prompt, contains('### 🎯 Correction plan for tomorrow'));
     });
   });
 }

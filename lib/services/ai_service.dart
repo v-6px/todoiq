@@ -3,7 +3,10 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../models/ai_failure.dart';
 import 'settings_service.dart';
+
+export '../models/ai_failure.dart';
 
 /// A single turn in a chat-completions request.
 class AiMessage {
@@ -22,17 +25,35 @@ class AiMessage {
 
 /// A failure the user can act on.
 ///
-/// [message] is written to be shown directly in the UI — it names what went
-/// wrong and, where possible, which field to fix.
+/// [message] is the technical English explanation, provider detail included —
+/// right for the settings screen's connection test and for logs. [kind] is
+/// what a screen shows everyone else, as a short translated sentence, so a
+/// user never has to read a raw JSON error body.
 class AiException implements Exception {
   final String message;
   final int? statusCode;
+  final AiFailure kind;
 
-  const AiException(this.message, {this.statusCode});
+  const AiException(
+    this.message, {
+    this.statusCode,
+    this.kind = AiFailure.other,
+  });
+
+  /// The failure category an HTTP status belongs to.
+  static AiFailure kindForStatus(int statusCode) {
+    if (statusCode == 401 || statusCode == 403) return AiFailure.unauthorized;
+    if (statusCode == 404) return AiFailure.notFound;
+    if (statusCode == 429) return AiFailure.rateLimited;
+    if (statusCode >= 500) return AiFailure.unavailable;
+    return AiFailure.other;
+  }
 
   /// True when the cause is missing configuration rather than a failed call,
   /// so the UI can offer a shortcut to Settings.
-  bool get isConfigurationError => statusCode == null && _isSetupMessage;
+  bool get isConfigurationError =>
+      kind == AiFailure.missingConfiguration ||
+      (statusCode == null && _isSetupMessage);
 
   bool get _isSetupMessage =>
       message.contains('API key') ||
@@ -51,34 +72,84 @@ class AiService {
   static const Duration defaultTimeout = Duration(seconds: 60);
   static const Duration pingTimeout = Duration(seconds: 20);
 
-  /// Reply budget for a debrief.
+  /// Reply budget for every generated reply, debrief and coach alike.
   ///
-  /// A debrief is several sections long, and a model that runs out of budget
-  /// stops mid-sentence rather than wrapping up — which reads as a bug. The
-  /// ceiling is deliberately far above what the prompt asks for, because the
-  /// prompt is what should decide the length; this only stops a runaway.
-  /// Arabic also costs noticeably more tokens per word than English, so the
-  /// same prompt needs more headroom in one language than the other.
-  static const int debriefMaxTokens = 2048;
+  /// A model that runs out of budget stops mid-sentence rather than wrapping
+  /// up, which reads as a bug rather than as a limit. The ceiling sits far
+  /// above what any prompt asks for, because the prompt is what should decide
+  /// the length — this only stops a runaway. Arabic costs noticeably more
+  /// tokens per word than English, so the same prompt needs more headroom in
+  /// one language than in another, and one generous number covers both.
+  ///
+  /// Thinking models — the default Gemini Flash among them — count their
+  /// hidden reasoning against `max_tokens` on the OpenAI-compatible endpoint.
+  /// At 2048 a debrief could spend most of the budget thinking and be cut off
+  /// a paragraph into the visible text. 8192 leaves the reasoning its room and
+  /// the report all of its own.
+  static const int defaultMaxTokens = 8192;
 
-  /// Reply budget for one coach turn, which is a couple of paragraphs plus a
-  /// possible task_action block.
-  static const int coachMaxTokens = 1024;
+  /// Kept as names so call sites read for themselves; both are the ceiling.
+  static const int debriefMaxTokens = defaultMaxTokens;
+  static const int coachMaxTokens = defaultMaxTokens;
+
+  /// How many times a reply cut off at the ceiling is asked to carry on.
+  ///
+  /// Only used where the caller opts in. Two is enough to finish any debrief
+  /// the prompt asks for, and bounds the cost of a model that never stops.
+  static const int maxContinuations = 2;
+
+  /// The turn that asks a truncated reply to carry on.
+  @visibleForTesting
+  static const String continuationPrompt =
+      'Your previous reply was cut off by the length limit. Continue exactly '
+      'where it stopped — mid-sentence if need be. Do not repeat anything, '
+      'do not restart a heading, and add no preamble.';
+
+  /// Budget for the connection ping. Enough that a model which cannot emit
+  /// fewer than a handful of tokens still answers, small enough to be free.
+  static const int pingMaxTokens = 10;
   static const String userAgent = 'TaskMaster/1.0 (Flutter)';
+
+  /// Statuses worth trying again: the provider is overloaded or a gateway in
+  /// front of it hiccupped. Gemini answers 503 "model is overloaded" under
+  /// load, and it usually clears within seconds.
+  static const Set<int> retryableStatuses = <int>{502, 503, 504};
+
+  /// Retries after the first attempt, so at most three requests in all.
+  static const int maxRetries = 2;
+
+  /// Longest wait honoured from a provider's `Retry-After` header.
+  static const Duration maxRetryDelay = Duration(seconds: 10);
+
+  /// 2s, then 4s.
+  static Duration defaultRetryBackoff(int retry) =>
+      Duration(seconds: 2 << (retry - 1));
 
   final http.Client _client;
 
   /// A client passed in belongs to the caller; one made here is ours to close.
   final bool _ownsClient;
 
-  AiService({http.Client? client})
-      : _client = client ?? http.Client(),
-        _ownsClient = client == null;
+  /// Wait before retry number `retry` (1-based). Injectable so tests of the
+  /// retry path do not sit through real seconds.
+  final Duration Function(int retry) _retryBackoff;
+
+  AiService({
+    http.Client? client,
+    @visibleForTesting Duration Function(int retry)? retryBackoff,
+  })  : _client = client ?? http.Client(),
+        _ownsClient = client == null,
+        _retryBackoff = retryBackoff ?? defaultRetryBackoff;
 
   /// Sends [messages] and returns the assistant's reply.
   ///
   /// Throws [AiException] for every failure path — missing configuration, a
   /// rejected request, or no connectivity — so callers have one thing to catch.
+  ///
+  /// With [continueIfTruncated], a reply the provider stopped at its token
+  /// ceiling (`finish_reason: length`) is not handed back half-written: the
+  /// partial text goes back as an assistant turn with a request to carry on,
+  /// up to [maxContinuations] times, and the pieces are joined.
   Future<String> complete(
     List<AiMessage> messages, {
     AiCredentials? credentials,
@@ -86,13 +157,143 @@ class AiService {
     double? temperature,
     Duration timeout = defaultTimeout,
     bool requireContent = true,
+    bool continueIfTruncated = false,
+    bool retryTransientFailures = true,
   }) async {
     final AiCredentials resolved = await _resolveCredentials(credentials);
-    final Uri endpoint = resolveEndpoint(resolved.baseUrl);
 
-    final http.Response response;
+    String text = await _completeOnce(
+      messages,
+      credentials: resolved,
+      maxTokens: maxTokens,
+      temperature: temperature,
+      timeout: timeout,
+      requireContent: requireContent,
+      retry: retryTransientFailures,
+    );
+    if (!continueIfTruncated) return text;
+
+    for (int round = 0;
+        round < maxContinuations && _lastFinishReason == 'length';
+        round++) {
+      debugPrint('AiService: reply hit the token ceiling; asking it to '
+          'continue (${round + 1}/$maxContinuations).');
+      // The original turns plus everything written so far, so the model sees
+      // one unbroken reply to extend. An empty continuation just means there
+      // was nothing left to say; what is already in hand stands.
+      final String more = await _completeOnce(
+        <AiMessage>[
+          ...messages,
+          AiMessage.assistant(text),
+          const AiMessage.user(continuationPrompt),
+        ],
+        credentials: resolved,
+        maxTokens: maxTokens,
+        temperature: temperature,
+        timeout: timeout,
+        requireContent: false,
+        retry: retryTransientFailures,
+      );
+      if (more.isEmpty) break;
+      text = joinContinuation(text, more);
+    }
+    return text;
+  }
+
+  /// `finish_reason` of the most recent reply, or null if it gave none.
+  String? _lastFinishReason;
+
+  /// Joins a continuation onto the text it continues.
+  ///
+  /// The reply is trimmed on the way in, so the whitespace at the seam is
+  /// gone: a continuation that starts a new block gets its line break back,
+  /// one that carries on a sentence gets a single space.
+  @visibleForTesting
+  static String joinContinuation(String head, String tail) {
+    final bool newBlock = tail.startsWith('#') ||
+        tail.startsWith('- ') ||
+        tail.startsWith('* ') ||
+        RegExp(r'^\d+\. ').hasMatch(tail);
+    return newBlock ? '$head\n\n$tail' : '$head $tail';
+  }
+
+  /// One logical request: the POST, retried on [retryableStatuses] with a
+  /// backoff when [retry] is set.
+  Future<String> _completeOnce(
+    List<AiMessage> messages, {
+    required AiCredentials credentials,
+    int? maxTokens,
+    double? temperature,
+    required Duration timeout,
+    required bool requireContent,
+    required bool retry,
+  }) async {
+    _lastFinishReason = null;
+    final Uri endpoint = resolveEndpoint(credentials.baseUrl);
+
+    for (int attempt = 0;; attempt++) {
+      final http.Response response = await _post(
+        endpoint,
+        messages,
+        credentials: credentials,
+        maxTokens: maxTokens,
+        temperature: temperature,
+        timeout: timeout,
+      );
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final String body = readBody(response);
+        if (warnIfTruncated(body)) _lastFinishReason = 'length';
+        return _extractContent(body, requireContent: requireContent);
+      }
+
+      final String failureBody = readBody(response);
+
+      // The whole body, verbatim. A 400 from an OpenAI-compatible server
+      // almost always names the offending field, and that sentence is the
+      // difference between a five-minute fix and an afternoon.
+      debugPrint('AiService: $endpoint returned HTTP '
+          '${response.statusCode} (attempt ${attempt + 1}). '
+          'Body: $failureBody');
+
+      if (retry &&
+          attempt < maxRetries &&
+          retryableStatuses.contains(response.statusCode)) {
+        final Duration wait =
+            _retryAfter(response) ?? _retryBackoff(attempt + 1);
+        debugPrint('AiService: retrying in ${wait.inMilliseconds}ms.');
+        await Future<void>.delayed(wait);
+        continue;
+      }
+
+      throw AiException(
+        describeHttpFailure(response.statusCode, failureBody),
+        statusCode: response.statusCode,
+        kind: AiException.kindForStatus(response.statusCode),
+      );
+    }
+  }
+
+  /// The provider's own `Retry-After`, in seconds, capped at [maxRetryDelay].
+  static Duration? _retryAfter(http.Response response) {
+    final int? seconds =
+        int.tryParse(response.headers['retry-after']?.trim() ?? '');
+    if (seconds == null || seconds < 0) return null;
+    final Duration wait = Duration(seconds: seconds);
+    return wait > maxRetryDelay ? maxRetryDelay : wait;
+  }
+
+  Future<http.Response> _post(
+    Uri endpoint,
+    List<AiMessage> messages, {
+    required AiCredentials credentials,
+    int? maxTokens,
+    double? temperature,
+    required Duration timeout,
+  }) async {
+    final AiCredentials resolved = credentials;
     try {
-      response = await _client
+      return await _client
           .post(
             endpoint,
             headers: <String, String>{
@@ -104,6 +305,17 @@ class AiService {
               'model': resolved.model,
               'messages':
                   messages.map((AiMessage m) => m.toJson()).toList(),
+              // Only the fields every OpenAI-compatible server understands.
+              // `max_completion_tokens` was sent alongside `max_tokens` for a
+              // while: OpenAI's newer models want it, but Gemini's
+              // compatibility layer validates the request strictly and
+              // rejects the unknown field with a 400, which took the whole
+              // app down for the default provider. One standard field beats
+              // one extra provider.
+              //
+              // Deliberately no `stop`: a stop sequence matching a heading or
+              // a blank line would end the reply early and look exactly like a
+              // token-limit cut.
               'max_tokens': ?maxTokens,
               'temperature': ?temperature,
             }),
@@ -122,17 +334,38 @@ class AiService {
 
       throw const AiException(
         'Could not reach the endpoint. Check the URL and your connection.',
+        kind: AiFailure.network,
       );
     }
+  }
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw AiException(
-        describeHttpFailure(response.statusCode, readBody(response)),
-        statusCode: response.statusCode,
-      );
+  /// Logs, and returns true, when the provider says it stopped because it
+  /// ran out of room.
+  ///
+  /// Nothing is cut on this side, but a `finish_reason` of `length` is the
+  /// provider telling us the text ends mid-thought — invisible on screen,
+  /// which is why callers that care opt into continuation.
+  @visibleForTesting
+  static bool warnIfTruncated(String body) {
+    if (!body.contains('"length"')) return false;
+
+    try {
+      final Object? decoded = jsonDecode(body);
+      if (decoded is! Map<String, Object?>) return false;
+      final Object? choices = decoded['choices'];
+      if (choices is! List<Object?> || choices.isEmpty) return false;
+      final Object? first = choices.first;
+      if (first is! Map<String, Object?>) return false;
+
+      if (first['finish_reason'] == 'length') {
+        debugPrint('AiService: the provider stopped at its token ceiling '
+            '(finish_reason: length, max_tokens $defaultMaxTokens).');
+        return true;
+      }
+    } on FormatException {
+      // Not our problem here; _extractContent reports an unreadable body.
     }
-
-    return _extractContent(readBody(response), requireContent: requireContent);
+    return false;
   }
 
   /// Builds the chat-completions URL, rejecting anything Uri cannot use.
@@ -150,6 +383,7 @@ class AiService {
       throw AiException(
         'That base URL is not a valid address: "$normalized". It should look '
         'like https://api.example.com/v1',
+        kind: AiFailure.invalidUrl,
       );
     }
 
@@ -173,7 +407,12 @@ class AiService {
     }
   }
 
-  /// A 2-token ping proving the endpoint, key and model work together.
+  /// A minimal ping proving the endpoint, key and model work together.
+  ///
+  /// Deliberately the plainest request the API allows — model, one user
+  /// message, a token ceiling, and nothing else. No temperature, no sampling
+  /// options, no vendor extensions: if this is rejected, the problem is the
+  /// URL, the key or the model name, and never a field the app added.
   ///
   /// Returns the model name on success; throws [AiException] otherwise.
   Future<String> testConnection({AiCredentials? credentials}) async {
@@ -182,9 +421,11 @@ class AiService {
     await complete(
       const <AiMessage>[AiMessage.user('ping')],
       credentials: resolved,
-      maxTokens: 2,
+      maxTokens: pingMaxTokens,
       timeout: pingTimeout,
       requireContent: false,
+      // The connection test should answer at once, with the real status.
+      retryTransientFailures: false,
     );
 
     return resolved.model;
@@ -204,13 +445,22 @@ class AiService {
     );
 
     if (stored.apiKey.isEmpty) {
-      throw const AiException('Add an API key in Settings first.');
+      throw const AiException(
+        'Add an API key in Settings first.',
+        kind: AiFailure.missingConfiguration,
+      );
     }
     if (stored.baseUrl.isEmpty) {
-      throw const AiException('Add a base URL in Settings first.');
+      throw const AiException(
+        'Add a base URL in Settings first.',
+        kind: AiFailure.missingConfiguration,
+      );
     }
     if (stored.model.isEmpty) {
-      throw const AiException('Add a model name in Settings first.');
+      throw const AiException(
+        'Add a model name in Settings first.',
+        kind: AiFailure.missingConfiguration,
+      );
     }
 
     return stored;
@@ -255,7 +505,10 @@ class AiService {
     // A 200 with no usable content usually means the model hit its token
     // budget before writing anything.
     if (!requireContent) return '';
-    throw const AiException('The provider returned an empty response.');
+    throw const AiException(
+      'The provider returned an empty response.',
+      kind: AiFailure.emptyResponse,
+    );
   }
 
   /// Turns a status code into something the user can act on.
@@ -280,7 +533,17 @@ class AiService {
     }
   }
 
-  /// Pulls `error.message` out of an OpenAI-style error body, if present.
+  /// Longest server explanation carried into the on-screen error.
+  ///
+  /// Long enough for a real validation message, short enough not to bury the
+  /// sentence that says what to do about it.
+  static const int maxApiMessageLength = 300;
+
+  /// Pulls the provider's own explanation out of an error body.
+  ///
+  /// Falls back to the raw body when it is not the OpenAI error shape: a
+  /// provider that rejects a request always says why somewhere, and showing
+  /// that verbatim beats showing only a status code.
   static String extractApiMessage(String body) {
     if (body.isEmpty) return '';
     try {
@@ -288,15 +551,27 @@ class AiService {
       if (decoded is Map<String, Object?>) {
         final Object? error = decoded['error'];
         if (error is Map<String, Object?> && error['message'] is String) {
-          return error['message']! as String;
+          return _clip(error['message']! as String);
         }
-        if (error is String) return error;
+        if (error is String) return _clip(error);
+        // Some servers answer with {"message": ...} and no "error" wrapper.
+        if (decoded['message'] is String) {
+          return _clip(decoded['message']! as String);
+        }
       }
+      return _clip(body);
     } catch (_) {
-      // Not JSON, or not the shape we expected — the status code alone will
-      // have to do.
+      // Not JSON at all — an HTML error page or a proxy notice. Still worth
+      // showing: it usually names the thing that rejected the request.
+      return _clip(body);
     }
-    return '';
+  }
+
+  /// One line, trimmed to [maxApiMessageLength].
+  static String _clip(String value) {
+    final String flat = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (flat.length <= maxApiMessageLength) return flat;
+    return '${flat.substring(0, maxApiMessageLength)}…';
   }
 
   void dispose() {

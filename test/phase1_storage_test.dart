@@ -3,6 +3,7 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'package:todo_list/models/chat_message_model.dart';
 import 'package:todo_list/models/report_range.dart';
 import 'package:todo_list/models/saved_report.dart';
 import 'package:todo_list/models/task_model.dart';
@@ -397,6 +398,150 @@ void main() {
 
       await DatabaseService.instance.close();
       DatabaseService.debugDatabaseName = 'phase1_test.db';
+    });
+
+    test('a v5 database gains the added flag without losing the chat',
+        () async {
+      await DatabaseService.instance.close();
+
+      final String path = p.join(
+        await databaseFactory.getDatabasesPath(),
+        'migration_v5_test.db',
+      );
+      await databaseFactory.deleteDatabase(path);
+
+      // The v5 chat table: no action_added column.
+      final Database v5 = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 5,
+          onCreate: (Database db, int version) async {
+            await db.execute(
+              'CREATE TABLE tasks ('
+              'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+              'title TEXT NOT NULL, '
+              'scheduled_time INTEGER NOT NULL, '
+              "status TEXT NOT NULL DEFAULT 'pending', "
+              'created_at INTEGER NOT NULL, '
+              'note TEXT, '
+              "recurrence_type TEXT NOT NULL DEFAULT 'none', "
+              'repeat_days TEXT, '
+              'status_date INTEGER)',
+            );
+            await db.execute(
+              'CREATE TABLE chat_messages ('
+              'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+              'role TEXT NOT NULL, '
+              'content TEXT NOT NULL, '
+              'created_at INTEGER NOT NULL)',
+            );
+          },
+        ),
+      );
+      await v5.insert('chat_messages', <String, Object?>{
+        'role': ChatRole.user,
+        'content': 'said before the flag existed',
+        'created_at': DateTime(2026, 9, 9).millisecondsSinceEpoch,
+      });
+      await v5.close();
+
+      DatabaseService.debugDatabaseName = 'migration_v5_test.db';
+
+      final List<ChatMessage> stored =
+          await DatabaseService.instance.getChatMessages();
+      expect(stored.single.content, 'said before the flag existed');
+      expect(
+        stored.single.actionAdded,
+        isFalse,
+        reason: 'an unknown history offers its cards again, which is the '
+            'safe direction to be wrong in',
+      );
+
+      // And the new column is writable.
+      await DatabaseService.instance.markChatActionAdded(stored.single.id!);
+      expect(
+        (await DatabaseService.instance.getChatMessages()).single.actionAdded,
+        isTrue,
+      );
+
+      await DatabaseService.instance.close();
+      DatabaseService.debugDatabaseName = 'phase1_test.db';
+    });
+
+    test('the added flag survives a round trip', () async {
+      await DatabaseService.instance.clearChatMessages();
+
+      final int id = await DatabaseService.instance.insertChatMessage(
+        ChatMessage.assistant('proposed something'),
+      );
+      expect(
+        (await DatabaseService.instance.getChatMessages()).single.actionAdded,
+        isFalse,
+      );
+
+      expect(await DatabaseService.instance.markChatActionAdded(id), 1);
+
+      final ChatMessage marked =
+          (await DatabaseService.instance.getChatMessages()).single;
+      expect(marked.actionAdded, isTrue);
+      expect(marked.id, id);
+
+      await DatabaseService.instance.clearChatMessages();
+    });
+
+    test('marking one turn leaves the rest alone', () async {
+      await DatabaseService.instance.clearChatMessages();
+
+      final int first = await DatabaseService.instance
+          .insertChatMessage(ChatMessage.assistant('first'));
+      await DatabaseService.instance
+          .insertChatMessage(ChatMessage.assistant('second'));
+
+      await DatabaseService.instance.markChatActionAdded(first);
+
+      final List<ChatMessage> all =
+          await DatabaseService.instance.getChatMessages();
+      expect(all.first.actionAdded, isTrue);
+      expect(all.last.actionAdded, isFalse);
+
+      await DatabaseService.instance.clearChatMessages();
+    });
+
+    test('an existing install gains the chat table on upgrade', () async {
+      // Not rebuilt from scratch here — the v3 fixture above already proves
+      // the stepwise path. This checks the v5 step lands on a database that
+      // has been through every earlier one.
+      expect(await DatabaseService.instance.getChatMessages(), isEmpty);
+
+      await DatabaseService.instance.insertChatMessage(
+        ChatMessage.user('does the table exist'),
+      );
+      final List<ChatMessage> stored =
+          await DatabaseService.instance.getChatMessages();
+      expect(stored.single.content, 'does the table exist');
+      expect(stored.single.role, ChatRole.user);
+
+      await DatabaseService.instance.clearChatMessages();
+      expect(await DatabaseService.instance.getChatMessages(), isEmpty);
+    });
+
+    test('turns come back in the order they were written', () async {
+      await DatabaseService.instance.clearChatMessages();
+      for (int i = 0; i < 5; i++) {
+        await DatabaseService.instance.insertChatMessage(ChatMessage(
+          role: i.isEven ? ChatRole.user : ChatRole.assistant,
+          content: 'turn $i',
+          timestamp: DateTime(2026, 9, 9, 10, i),
+        ));
+      }
+
+      expect(
+        (await DatabaseService.instance.getChatMessages())
+            .map((ChatMessage m) => m.content)
+            .toList(),
+        <String>['turn 0', 'turn 1', 'turn 2', 'turn 3', 'turn 4'],
+      );
+      await DatabaseService.instance.clearChatMessages();
     });
   });
 

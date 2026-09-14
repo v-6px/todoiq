@@ -71,17 +71,23 @@ class Task {
   /// fall back to pending.
   final DateTime? statusDate;
 
+  /// Every instant is held in local time. A UTC value slipping in — from a
+  /// parsed ISO string, say — would otherwise put `.day` and `.hour` on the
+  /// UTC calendar, and the task would land on the wrong day for anyone far
+  /// enough from Greenwich.
   Task({
     this.id,
     required this.title,
-    required this.scheduledTime,
+    required DateTime scheduledTime,
     this.status = TaskStatus.pending,
     DateTime? createdAt,
     this.note,
     this.recurrenceType = RecurrenceType.none,
     this.repeatDays,
-    this.statusDate,
-  }) : createdAt = createdAt ?? DateTime.now();
+    DateTime? statusDate,
+  })  : scheduledTime = scheduledTime.toLocal(),
+        createdAt = (createdAt ?? DateTime.now()).toLocal(),
+        statusDate = statusDate?.toLocal();
 
   /// Serialises to the column layout of the `tasks` table.
   ///
@@ -217,8 +223,35 @@ class Task {
 
   // --- Serialisation helpers ---------------------------------------------
 
-  static DateTime dayStart(DateTime value) =>
-      DateTime(value.year, value.month, value.day);
+  /// Local midnight at the start of [value]'s local calendar day.
+  static DateTime dayStart(DateTime value) {
+    final DateTime local = value.toLocal();
+    return DateTime(local.year, local.month, local.day);
+  }
+
+  /// Local midnight [days] calendar days after [value]'s day.
+  ///
+  /// Never `add(Duration(days: n))`: on the day clocks go back that is 25
+  /// hours, and midnight plus 24 hours is 23:00 on the *same* day — which
+  /// repeats a day in every range walk and strands the day stepper.
+  static DateTime addDays(DateTime value, int days) {
+    final DateTime local = value.toLocal();
+    return DateTime(local.year, local.month, local.day + days);
+  }
+
+  /// The local calendar day as `yyyymmdd`.
+  ///
+  /// What per-day history is keyed on. Unlike an epoch at midnight it names
+  /// the same day whatever the device's time zone is when it is read back,
+  /// so travelling does not detach a completion from its day.
+  static int dayKey(DateTime value) {
+    final DateTime local = value.toLocal();
+    return local.year * 10000 + local.month * 100 + local.day;
+  }
+
+  /// The local midnight a [dayKey] names.
+  static DateTime fromDayKey(int key) =>
+      DateTime(key ~/ 10000, (key ~/ 100) % 100, key % 100);
 
   /// Weekdays as a sorted, deduplicated `"1,3,5"` string, or null when empty.
   static String? encodeRepeatDays(List<int>? days) {
@@ -253,4 +286,45 @@ class Task {
       'Task(id: $id, title: $title, scheduledTime: $scheduledTime, '
       'status: $status, createdAt: $createdAt, note: $note, '
       'recurrence: $recurrenceType, repeatDays: $repeatDays)';
+}
+
+/// What happened to one occurrence of a recurring task.
+///
+/// A recurring task is one row in `tasks`, so its per-day outcomes live in
+/// their own table, one row per task per day. Marking Tuesday done can then
+/// never overwrite Monday, and the recurrence itself never has to be touched
+/// to record that today's instance is finished.
+class TaskCompletion {
+  final int taskId;
+
+  /// [Task.dayKey] of the occurrence.
+  final int day;
+  final String status;
+  final String? note;
+  final DateTime updatedAt;
+
+  TaskCompletion({
+    required this.taskId,
+    required this.day,
+    required this.status,
+    this.note,
+    DateTime? updatedAt,
+  }) : updatedAt = updatedAt ?? DateTime.now();
+
+  Map<String, Object?> toMap() => <String, Object?>{
+        'task_id': taskId,
+        'day': day,
+        'status': status,
+        'note': note,
+        'updated_at': updatedAt.millisecondsSinceEpoch,
+      };
+
+  factory TaskCompletion.fromMap(Map<String, Object?> map) => TaskCompletion(
+        taskId: map['task_id'] as int,
+        day: map['day'] as int,
+        status: map['status'] as String,
+        note: map['note'] as String?,
+        updatedAt:
+            DateTime.fromMillisecondsSinceEpoch(map['updated_at'] as int),
+      );
 }

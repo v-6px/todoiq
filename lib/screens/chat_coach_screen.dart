@@ -25,6 +25,8 @@ class ChatCoachScreen extends StatefulWidget {
   static const Key sendKey = Key('coach_send');
   static const Key listKey = Key('coach_list');
   static const Key settingsShortcutKey = Key('coach_settings_shortcut');
+  static const Key menuKey = Key('coach_menu');
+  static const Key clearChatKey = Key('coach_clear_chat');
 
   static Key bubbleKey(int index) => Key('coach_bubble_$index');
 
@@ -35,9 +37,16 @@ class ChatCoachScreen extends StatefulWidget {
 
   /// The day to coach on. Injectable so tests are not clock-dependent.
   final DateTime? day;
+
+  /// The real today, which relative dates ("tomorrow") are worked out from.
+  ///
+  /// Distinct from [day]: opened while browsing next Friday, the log is
+  /// Friday's but "tomorrow" still means the day after today. Defaults to
+  /// [day] when injected, else the device's local date.
+  final DateTime? today;
   final http.Client? client;
 
-  const ChatCoachScreen({super.key, this.day, this.client});
+  const ChatCoachScreen({super.key, this.day, this.today, this.client});
 
   /// Builds the task-aware system turn.
   ///
@@ -47,6 +56,7 @@ class ChatCoachScreen extends StatefulWidget {
     List<Task> tasks,
     DateTime day, {
     AppStrings strings = AppStrings.en,
+    DateTime? today,
   }) {
     // The log stays in English so the model reads a stable format; the reply
     // language is set explicitly at the end.
@@ -57,6 +67,8 @@ class ChatCoachScreen extends StatefulWidget {
           'paragraphs at most, and ask a follow-up question when it would '
           'help. Reference their real tasks by name. Never invent tasks that '
           'are not listed. Plain, warm language; no corporate jargon.')
+      ..writeln()
+      ..writeln(taskActionInstructions(today ?? day))
       ..writeln()
       ..writeln('Their task log for '
           "${DateFormat('EEEE d MMMM', 'en').format(day)}:");
@@ -77,12 +89,11 @@ class ChatCoachScreen extends StatefulWidget {
 
     buffer
       ..writeln()
-      ..writeln('Open by reflecting briefly on what stands out — especially '
+      ..writeln('When they are NOT asking for something to be scheduled, '
+          'open by reflecting briefly on what stands out — especially '
           'anything partial or skipped and the reasons given — then help them '
           'unblock the rest of the day.')
-      ..writeln(strings.replyLanguageInstruction)
-      ..writeln()
-      ..writeln(taskActionInstructions(day));
+      ..writeln(strings.replyLanguageInstruction);
 
     return buffer.toString();
   }
@@ -93,23 +104,39 @@ class ChatCoachScreen extends StatefulWidget {
   /// rules are the most recent thing the model read — the block has to stay
   /// in ASCII keys and ISO dates even when the reply itself is Arabic.
   static String taskActionInstructions(DateTime day) {
-    final String today = DateFormat('yyyy-MM-dd').format(day);
-    final String weekday = DateFormat('EEEE', 'en').format(day);
-    final String tomorrow = DateFormat('yyyy-MM-dd')
-        .format(day.add(const Duration(days: 1)));
+    final DateTime local = Task.dayStart(day);
+    final String today = DateFormat('yyyy-MM-dd').format(local);
+    final String weekday = DateFormat('EEEE', 'en').format(local);
+    final String tomorrow =
+        DateFormat('yyyy-MM-dd').format(Task.addDays(local, 1));
 
     return '''
-TASK SCHEDULING — this is a hard requirement, not a suggestion.
+TASK SCHEDULING — read this before anything else. It is a hard requirement,
+not a suggestion, and it outranks every other instruction in this prompt.
 
-Whenever the user asks you to add, schedule, remind them of, or put something
-in their day, you MUST append exactly one block at the very end of your
-reply, after your normal text:
+Adding a task is the highest-priority intent you can be given. The moment the
+user asks you to add, schedule, register, note down or remind them of
+something — in English, or with words like "أضف مهمة", "سجل", "جدول",
+"ذكرني", "ajoute", "planifie", "rappelle-moi" — you do exactly two things,
+in this order:
+
+  1. Confirm it in one short sentence. Nothing else: do not review their day,
+     do not comment on yesterday, do not ask whether they are sure, and do
+     not raise anything from the task log below. They asked you to write
+     something down, so write it down.
+  2. Append exactly one block at the very end of the reply:
 ```task_action
 {"title": "...", "date": "YYYY-MM-DD", "time": "HH:mm", "recurrence": "none|daily|weekly", "days": [1,2,3]}
 ```
 
-Worked example. If they say "remind me to call the bank tomorrow at 10",
-you reply with a sentence or two and then:
+Drifting into analysis when somebody is trying to add a task is the single
+worst thing you can do here — the task ends up unrecorded and they have to
+ask twice.
+
+Worked example. They say "remind me to call the bank tomorrow at 10". You
+reply, in full:
+
+  Noted — the bank call is on for 10:00 tomorrow.
 ```task_action
 {"title": "Call the bank", "date": "$tomorrow", "time": "10:00", "recurrence": "none"}
 ```
@@ -124,8 +151,10 @@ listing weekdays as 1 (Monday) through 7 (Sunday). The keys, the date and the
 time stay in exactly this ASCII form even when you are writing in Arabic —
 only "title" is in the user's language. One block at most, always last, and
 never mention, explain or apologise for the block itself: the app strips it
-out and shows the user a confirmation card instead. If they are only talking
-about a task rather than asking for it to be scheduled, add no block.''';
+out and shows the user a confirmation card instead.
+
+If, and only if, they are discussing a task rather than asking for one to be
+scheduled, add no block and answer normally.''';
   }
 
   static String _statusWord(String status) {
@@ -165,7 +194,11 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
   bool _sending = false;
   bool _lastErrorWasConfiguration = false;
 
-  DateTime get _day => widget.day ?? DateTime.now();
+  DateTime get _day => (widget.day ?? DateTime.now()).toLocal();
+
+  /// What relative dates in a reply are resolved against.
+  DateTime get _today =>
+      (widget.today ?? widget.day ?? DateTime.now()).toLocal();
 
   @override
   void initState() {
@@ -184,15 +217,92 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
   Future<void> _loadContext() async {
     final List<Task> tasks =
         await DatabaseService.instance.getTasksForDate(_day);
+    final List<ChatMessage> stored =
+        await DatabaseService.instance.getChatMessages();
     if (!mounted) return;
+
     setState(() {
       _systemPrompt = ChatCoachScreen.buildSystemPrompt(
         tasks,
         _day,
         strings: AppStrings.of(context),
+        today: _today,
       );
+
+      _visible
+        ..clear()
+        ..addAll(_restore(stored));
       _loading = false;
     });
+
+    if (_visible.isNotEmpty) _scrollToEnd();
+  }
+
+  /// Rebuilds the rendered conversation from stored turns.
+  ///
+  /// Assistant turns were stored raw, so the action block is parsed out again
+  /// here: the prose is shown, the JSON is not, and a task the assistant
+  /// proposed last night is still offered as a card this morning.
+  List<ChatMessage> _restore(List<ChatMessage> stored) {
+    final List<ChatMessage> restored = <ChatMessage>[];
+
+    for (final ChatMessage message in stored) {
+      if (!message.isAssistant) {
+        restored.add(message);
+        continue;
+      }
+
+      final CoachReply parsed = CoachReply.parse(message.content, now: _today);
+      if (parsed.action != null) {
+        _proposals[restored.length] = _ProposedTask(
+          parsed.action!,
+          messageId: message.id,
+          // A proposal already accepted comes back as a receipt, not as a
+          // button — otherwise reopening the screen is an invitation to
+          // create the same task again.
+          added: message.actionAdded,
+        );
+      }
+      restored.add(message.copyWith(content: parsed.text));
+    }
+
+    return restored;
+  }
+
+  /// Writes one turn to the conversation history, without blocking the UI on
+  /// it. A reply the user can already read is worth more than a guaranteed
+  /// write, so a failure here is logged and dropped.
+  Future<int?> _persist(ChatMessage message) async {
+    try {
+      return await DatabaseService.instance.insertChatMessage(message);
+    } catch (error, stack) {
+      debugPrint('ChatCoachScreen: could not store a ${message.role} turn '
+          'with ${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'ChatCoachScreen');
+      return null;
+    }
+  }
+
+  /// Empties the conversation, on screen and on disk.
+  Future<void> _clearChat(AppStrings strings) async {
+    setState(() {
+      _visible.clear();
+      _proposals.clear();
+      _lastErrorWasConfiguration = false;
+    });
+
+    await DatabaseService.instance.clearChatMessages();
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(strings.chatCleared),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 2),
+        ),
+      );
   }
 
   Future<void> _send() async {
@@ -201,13 +311,18 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
     if (text.isEmpty || _sending) return;
 
     _input.clear();
+    final ChatMessage question = ChatMessage.user(text);
     setState(() {
-      _visible.add(ChatMessage.user(text));
+      _visible.add(question);
       _visible.add(ChatMessage.assistant('', isPending: true));
       _sending = true;
       _lastErrorWasConfiguration = false;
     });
     _scrollToEnd();
+
+    // Stored as asked, before the reply is known: a question that failed to
+    // send is still part of the conversation the user had.
+    await _persist(question);
 
     try {
       final String reply = await _ai.complete(
@@ -226,7 +341,7 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
       if (!mounted) return;
       // The block is stripped before the text is stored, so the raw JSON is
       // never rendered and never echoed back into the next turn's history.
-      final CoachReply parsed = CoachReply.parse(reply, now: _day);
+      final CoachReply parsed = CoachReply.parse(reply, now: _today);
 
       // A model that talked about scheduling and then shipped no block is a
       // prompt problem, not a user error — and it is invisible from the
@@ -253,11 +368,26 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
         }
         _sending = false;
       });
+
+      // Stored raw, block and all. Stripping it here would lose the proposal
+      // on the next launch; it is parsed out again on the way back in.
+      if (!unusable) {
+        final int? rowId = await _persist(ChatMessage.assistant(reply));
+        // The card needs to know which row to mark once it is confirmed.
+        _proposals[_visible.length - 1]?.messageId = rowId;
+      }
     } on AiException catch (error) {
+      // Status and provider body go to the log; the bubble gets one plain
+      // sentence in the user's language, never the raw JSON.
+      debugPrint('ChatCoachScreen: reply failed (${error.kind}): '
+          '${error.message}');
       if (!mounted) return;
       setState(() {
         _replacePending(
-          ChatMessage.assistant(error.message, isError: true),
+          ChatMessage.assistant(
+            _friendlyError(error.kind, strings),
+            isError: true,
+          ),
         );
         _lastErrorWasConfiguration = error.isConfigurationError;
         _sending = false;
@@ -272,6 +402,18 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
       });
     }
     _scrollToEnd();
+  }
+
+  /// The shared translated explanation for [kind], except where that one
+  /// talks about a report — in a conversation the coach's own wording fits.
+  static String _friendlyError(AiFailure kind, AppStrings strings) {
+    switch (kind) {
+      case AiFailure.emptyResponse:
+      case AiFailure.other:
+        return strings.coachGenericError;
+      default:
+        return strings.aiFailure(kind);
+    }
   }
 
   /// Returns the index the replacement landed at.
@@ -315,6 +457,19 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
     // Saved either way past this point; a refused alarm is reported as such
     // rather than as a failed add.
     final int? armed = await NotificationService.instance.trySchedule(saved);
+
+    // Recorded before anything else can interrupt, so closing the screen
+    // straight after confirming still leaves the proposal marked as taken.
+    final int? messageId = proposal.messageId;
+    if (messageId != null) {
+      try {
+        await DatabaseService.instance.markChatActionAdded(messageId);
+      } catch (error, stack) {
+        debugPrint('ChatCoachScreen: could not mark chat row $messageId as '
+            'added, so its card may be offered again: $error');
+        debugPrintStack(stackTrace: stack, label: 'ChatCoachScreen');
+      }
+    }
 
     if (!mounted) return;
     setState(() {
@@ -403,7 +558,40 @@ class _ChatCoachScreenState extends State<ChatCoachScreen> {
             padding: EdgeInsets.zero,
           ),
           const SizedBox(width: AppSpacing.sm),
-          Text(strings.coachTitle, style: AppText.displayLg),
+          Expanded(
+            child: Text(strings.coachTitle, style: AppText.displayLg),
+          ),
+          // Only offered once there is something to clear.
+          if (_visible.isNotEmpty)
+            PopupMenuButton<String>(
+              key: ChatCoachScreen.menuKey,
+              icon: const Icon(
+                Icons.more_horiz_rounded,
+                size: 20,
+                color: AppColors.inkMute,
+              ),
+              tooltip: strings.clearChat,
+              position: PopupMenuPosition.under,
+              onSelected: (_) => _clearChat(strings),
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                PopupMenuItem<String>(
+                  key: ChatCoachScreen.clearChatKey,
+                  value: 'clear',
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      const Icon(
+                        Icons.delete_outline_rounded,
+                        size: 18,
+                        color: AppColors.inkMute,
+                      ),
+                      const SizedBox(width: AppSpacing.sm),
+                      Text(strings.clearChat, style: AppText.bodyMd),
+                    ],
+                  ),
+                ),
+              ],
+            ),
         ],
       ),
     );
@@ -545,13 +733,21 @@ class _CoachEmptyState extends StatelessWidget {
 
 /// One chat bubble. The user's turn is the filled indigo; the coach replies on
 /// the soft canvas so the conversation reads as a column, not a ping-pong.
-/// A task the coach proposed, plus where the user has got to with it.
+/// A task the assistant proposed, plus where the user has got to with it.
 class _ProposedTask {
   final TaskAction action;
+
+  /// The `chat_messages` row this came from, once it has been written.
+  ///
+  /// Null only for the moment between the reply arriving and the insert
+  /// returning; a card confirmed inside that window still adds the task, it
+  /// just cannot record the fact, and will offer itself again next time.
+  int? messageId;
+
   bool adding = false;
   bool added = false;
 
-  _ProposedTask(this.action);
+  _ProposedTask(this.action, {this.messageId, this.added = false});
 }
 
 class _Bubble extends StatelessWidget {

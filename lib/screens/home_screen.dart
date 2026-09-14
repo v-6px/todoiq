@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -155,14 +157,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   /// The day on screen. Starts at [HomeScreen.day] (or today) and moves with
   /// the header arrows.
-  late DateTime _day = _midnight(widget.day ?? DateTime.now());
+  late DateTime _day = _midnight(widget.day ?? _localNow());
 
-  /// Today, fixed at the widget's reference point so tests are not
-  /// clock-dependent.
-  late final DateTime _today = _midnight(widget.day ?? DateTime.now());
+  /// Today on the device's local calendar.
+  ///
+  /// Fixed at [HomeScreen.day] when one is injected, so tests are not
+  /// clock-dependent. Otherwise it follows the clock: an app left open
+  /// overnight must not keep calling yesterday "today".
+  late DateTime _today = _midnight(widget.day ?? _localNow());
 
-  static DateTime _midnight(DateTime value) =>
-      DateTime(value.year, value.month, value.day);
+  /// Re-reads the wall clock every [_dateCheckInterval].
+  ///
+  /// A poll rather than one timer aimed at midnight: Dart timers run on a
+  /// monotonic clock that stops while the phone sleeps, so a midnight timer
+  /// set in the evening can fire hours late and leave yesterday on screen.
+  /// Comparing against the wall clock each tick cannot drift.
+  Timer? _dateTimer;
+  static const Duration _dateCheckInterval = Duration(seconds: 30);
+
+  static DateTime _localNow() => DateTime.now().toLocal();
+
+  /// Bumped on every load, so a slow read that started before a newer change
+  /// cannot land afterwards and paint stale state over it.
+  int _loadGeneration = 0;
+
+  static DateTime _midnight(DateTime value) => Task.dayStart(value);
 
   bool get _isToday => _day == _today;
 
@@ -170,22 +189,48 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (widget.day == null) {
+      _dateTimer = Timer.periodic(_dateCheckInterval, (_) => _syncToday());
+    }
     _loadTasks();
     _requestPermissions();
   }
 
   @override
   void dispose() {
+    _dateTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Coming back into the foreground is the moment the answer may have
-    // changed — either from the settings screen this banner opens, or from
-    // the user revoking the permission while away.
-    if (state == AppLifecycleState.resumed) _refreshAlarmPermission();
+    if (state == AppLifecycleState.resumed) {
+      // First, and synchronously: the date is what everything else on screen
+      // hangs off, so it must be right before anything else reloads.
+      _syncToday();
+      // The alarm permission may have changed too — from the settings screen
+      // the banner opens, or revoked while the user was away.
+      _refreshAlarmPermission();
+    }
+  }
+
+  /// Moves "today" to the device's current local date if the calendar has
+  /// turned over. Returns true if it did.
+  ///
+  /// Called on resume, on a timer, and before anything that acts on "today"
+  /// — so a tap never lands on a day that has already ended. Someone looking
+  /// at today is carried along to the new today; someone deliberately
+  /// browsing another day stays there, and gains the "Today" shortcut.
+  bool _syncToday() {
+    if (widget.day != null || !mounted) return false;
+    final DateTime now = _midnight(_localNow());
+    if (now == _today) return false;
+
+    final bool wasOnToday = _isToday;
+    setState(() => _today = now);
+    if (wasOnToday) _goToDay(now);
+    return true;
   }
 
   /// Asks at launch rather than at first save.
@@ -242,9 +287,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _loadTasks() async {
+    final int generation = ++_loadGeneration;
     final List<Task> tasks =
         await DatabaseService.instance.getTasksForDate(_day);
-    if (!mounted) return;
+    if (!mounted || generation != _loadGeneration) return;
     setState(() {
       _tasks = tasks;
       _loading = false;
@@ -257,9 +303,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// guarantees a completed, partial or skipped task can never leave a live
   /// alarm behind. Tapping the status a task already has clears it back to
   /// pending and re-arms the alarm if the time is still ahead.
-  Future<void> _changeStatus(Task task, String status) async {
-    final int? id = task.id;
+  Future<void> _changeStatus(Task tapped, String status) async {
+    final int? id = tapped.id;
     if (id == null) return;
+
+    // A tap made on a day that has since ended would record against
+    // yesterday. Roll over and let the user act on the real today instead.
+    if (_syncToday()) return;
+
+    // One change per task at a time. A second tap while the first is still
+    // being written reads as "tap the active status again", which is undo —
+    // so a quick double-tap on the checkmark used to uncheck it again.
+    if (!_statusInFlight.add(id)) return;
+    try {
+      await _applyStatusChange(tapped, status);
+    } finally {
+      _statusInFlight.remove(id);
+    }
+  }
+
+  /// Task ids with a status change still being written.
+  final Set<int> _statusInFlight = <int>{};
+
+  Future<void> _applyStatusChange(Task tapped, String status) async {
+    final int id = tapped.id!;
+
+    // The freshest copy on screen, not the one captured when the card was
+    // built, so the undo decision reads the state the user is looking at.
+    final Task task = _tasks.firstWhere(
+      (Task t) => t.id == id,
+      orElse: () => tapped,
+    );
 
     // For a recurring task the status belongs to the day on screen, not to
     // the row as a whole.
@@ -280,24 +354,102 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         initialNote: task.noteOn(_day),
       );
       note = result.note;
+      if (!mounted) return;
     }
 
-    await DatabaseService.instance
-        .updateStatusWithNote(id, next, note, forDate: _day);
-    await NotificationService.instance.cancelNotification(id);
+    // Paint first. Writing the row, cancelling the alarm and re-reading the
+    // day is three round trips — one of them eight platform-channel calls —
+    // and until this was hoisted above them the checkmark did nothing visible
+    // for long enough to look broken.
+    _applyStatusLocally(task, next, note);
 
-    if (next == TaskStatus.pending) {
-      // Re-arm whatever the task's recurrence calls for; a one-off in the
-      // past simply arms nothing. Best-effort: undoing a status must not fail
-      // because the OS is refusing alarms.
-      await NotificationService.instance.trySchedule(task);
+    // Any load already in flight read the row before this write; it must not
+    // land afterwards and uncheck the box.
+    _loadGeneration++;
+    final DateTime day = _day;
+
+    try {
+      // The write goes first and alone: it is the part that has to stick.
+      await DatabaseService.instance
+          .updateStatusWithNote(id, next, note, forDate: day);
+    } catch (error, stack) {
+      debugPrint('HomeScreen: could not record $next on task $id with '
+          '${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'HomeScreen');
     }
 
+    await _syncAlarms(task, next);
+
+    // Reconcile with what was actually stored. On the happy path this repaints
+    // the same thing; if the write failed, the optimistic change is undone
+    // here rather than left on screen as a lie.
     await _loadTasks();
   }
 
+  /// Brings [task]'s alarms in line with a status change to [next].
+  ///
+  /// A one-off that is resolved has nothing left to ring for; one returned
+  /// to pending is re-armed if its time is still ahead. A recurring task is
+  /// never simply cancelled — that would silence every future day. It is
+  /// re-armed from the next instance still open: tomorrow if today's is done,
+  /// today if it is not. Best-effort throughout: an OS refusing alarms must
+  /// never undo a status the database already holds.
+  Future<void> _syncAlarms(Task task, String next) async {
+    final int id = task.id!;
+    final NotificationService alarms = NotificationService.instance;
+
+    if (!task.isRecurring) {
+      if (next == TaskStatus.pending) {
+        await alarms.trySchedule(task.copyWith(status: next));
+      } else {
+        await alarms.tryCancelNotification(id);
+      }
+      return;
+    }
+
+    try {
+      // Read back rather than inferred from [next]: the change may have been
+      // made on another day, and only today's outcome decides today's alarm.
+      final Task? current = await DatabaseService.instance
+          .getTaskOnDate(id, DateTime.now());
+      if (current != null) await alarms.trySchedule(current);
+    } catch (error, stack) {
+      debugPrint('HomeScreen: could not re-arm task $id with '
+          '${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'HomeScreen');
+    }
+  }
+
+  /// Shows [next] on [task] immediately, in the right place in the list.
+  ///
+  /// Mirrors what the database write plus a reload would produce — including
+  /// the re-sort, so a completed task drops to the bottom on the same frame
+  /// rather than jumping down a moment later.
+  void _applyStatusLocally(Task task, String next, String? note) {
+    final int index = _tasks.indexWhere((Task t) => t.id == task.id);
+    if (index == -1) return;
+
+    final String? trimmed =
+        (note == null || note.trim().isEmpty) ? null : note.trim();
+
+    setState(() {
+      _tasks[index] = _tasks[index].copyWith(
+        status: next,
+        note: trimmed,
+        clearNote: trimmed == null,
+        // The status belongs to the day on screen, which is what stops a
+        // recurring task's completion leaking into tomorrow.
+        statusDate: _day,
+      );
+      _tasks.sort((Task a, Task b) =>
+          DatabaseService.compareForDay(a, b, _day));
+    });
+  }
+
   Future<void> _addTask() async {
-    final Task? created = await AddTaskSheet.show(context, day: _day);
+    if (_syncToday()) return;
+    final Task? created =
+        await AddTaskSheet.show(context, day: _day, today: _today);
     if (created != null) {
       await _loadTasks();
     }
@@ -311,6 +463,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final Task? updated = await AddTaskSheet.show(
       context,
       day: _day,
+      today: _today,
       task: task,
     );
     if (updated != null) {
@@ -321,16 +474,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// Deletes [task], with a window to take it back.
   ///
   /// The row goes immediately — a confirmation dialog on every swipe is the
-  /// heavier tax, because deleting is rare and undoing is cheap. The alarm is
-  /// cancelled first so a deleted task can never fire.
+  /// heavier tax, because deleting is rare and undoing is cheap.
+  ///
+  /// Order matters. The card leaves the list on this frame, because a
+  /// dismissed [Dismissible] must not be rebuilt. The row is deleted next, on
+  /// its own, so nothing can stand between the swipe and the DELETE — alarm
+  /// cancellation used to go first, and a plugin that threw left the row in
+  /// place to reappear on the next reload. The alarms are cleared after, and
+  /// a failure there is logged rather than allowed to resurrect the task.
   Future<void> _deleteTask(Task task) async {
     final int? id = task.id;
     if (id == null) return;
 
     final AppStrings strings = AppStrings.of(context);
 
-    await NotificationService.instance.cancelNotification(id);
-    await DatabaseService.instance.deleteTask(id);
+    _loadGeneration++;
+    setState(() => _tasks.removeWhere((Task t) => t.id == id));
+
+    List<TaskCompletion> history = const <TaskCompletion>[];
+    try {
+      // Only a recurring task has per-day history worth keeping for undo.
+      if (task.isRecurring) {
+        history = await DatabaseService.instance.getCompletionsForTask(id);
+      }
+      await DatabaseService.instance.deleteTask(id);
+    } catch (error, stack) {
+      debugPrint('HomeScreen: could not delete task $id with '
+          '${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'HomeScreen');
+      // Show what is really stored rather than pretend it went.
+      await _loadTasks();
+      return;
+    }
+
+    await NotificationService.instance.tryCancelNotification(id);
     await _loadTasks();
 
     if (!mounted) return;
@@ -343,7 +520,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           duration: const Duration(seconds: 5),
           action: SnackBarAction(
             label: strings.undo,
-            onPressed: () => _restoreTask(task),
+            onPressed: () => _restoreTask(task, history),
           ),
         ),
       );
@@ -353,11 +530,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   ///
   /// [Task.toMap] carries the id when it has one, so SQLite reuses the same
   /// primary key — which keeps the restored task's alarm ids identical to the
-  /// ones that were just cancelled.
-  Future<void> _restoreTask(Task task) async {
+  /// ones that were just cancelled. A recurring task's per-day [history]
+  /// comes back with it.
+  Future<void> _restoreTask(Task task, List<TaskCompletion> history) async {
     try {
-      await DatabaseService.instance.insertTask(task);
-      await NotificationService.instance.trySchedule(task);
+      await DatabaseService.instance
+          .restoreTask(task, completions: history);
+      final Task current = await DatabaseService.instance
+              .getTaskOnDate(task.id!, DateTime.now()) ??
+          task;
+      // A one-off already dealt with has nothing left to ring for.
+      if (current.isRecurring || current.isPending) {
+        await NotificationService.instance.trySchedule(current);
+      }
     } catch (error, stack) {
       debugPrint('HomeScreen: could not restore "${task.title}" with '
           '${error.runtimeType}: $error');
@@ -366,28 +551,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _loadTasks();
   }
 
-  Future<void> _openReports() {
-    return Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext context) => const ReportScreen(),
-      ),
+  /// Pushes [page], and re-checks the date on the way back — time spent on
+  /// another screen can carry the clock past midnight.
+  Future<void> _open(Widget page) async {
+    _syncToday();
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (BuildContext context) => page),
     );
+    _syncToday();
   }
 
-  Future<void> _openSettings() {
-    return Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext context) => const SettingsScreen(),
-      ),
-    );
-  }
+  Future<void> _openReports() => _open(const ReportScreen());
+
+  Future<void> _openSettings() => _open(const SettingsScreen());
 
   Future<void> _openCoach() {
-    return Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext context) => ChatCoachScreen(day: _day),
-      ),
-    );
+    _syncToday();
+    return _open(ChatCoachScreen(day: _day, today: _today));
   }
 
   @override
@@ -408,9 +588,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   .where((Task t) => t.statusOn(_day) == TaskStatus.pending)
                   .length,
               totalCount: _tasks.length,
-              onPreviousDay: () =>
-                  _goToDay(_day.subtract(const Duration(days: 1))),
-              onNextDay: () => _goToDay(_day.add(const Duration(days: 1))),
+              onPreviousDay: () => _goToDay(Task.addDays(_day, -1)),
+              onNextDay: () => _goToDay(Task.addDays(_day, 1)),
               onToday: () => _goToDay(_today),
               onReports: _openReports,
               onChat: _openCoach,
@@ -608,7 +787,9 @@ class _Header extends StatelessWidget {
               ),
               _HeaderAction(
                 actionKey: HomeScreen.chatKey,
-                icon: Icons.chat_bubble_outline,
+                // An assistant rather than a bare chat bubble, to match what
+                // the label now calls it.
+                icon: Icons.assistant_outlined,
                 tooltip: strings.aiCoach,
                 onPressed: onChat,
               ),

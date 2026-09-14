@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
@@ -81,7 +82,37 @@ class NotificationService {
     );
 
     await _plugin.initialize(settings);
+    await ensureChannel();
     _initialized = true;
+  }
+
+  /// Creates the Android channel up front rather than on the first alarm.
+  ///
+  /// Otherwise the channel only comes into being when the OS delivers the
+  /// first notification, from a background receiver — and a user who opens
+  /// the system notification settings before then finds nothing to enable.
+  /// Creating an existing channel is a no-op, so this is safe on every launch.
+  Future<void> ensureChannel() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.createNotificationChannel(
+            const AndroidNotificationChannel(
+              channelId,
+              channelName,
+              description: channelDescription,
+              importance: Importance.max,
+              playSound: true,
+              enableVibration: true,
+            ),
+          );
+    } catch (error) {
+      // The plugin creates it on first use anyway; never block launch on it.
+      debugPrint('NotificationService: could not create the channel '
+          '(${error.runtimeType}: $error).');
+    }
   }
 
   /// Points `tz.local` at a zone matching the device's current UTC offset.
@@ -90,19 +121,30 @@ class NotificationService {
   /// so the offset is matched against the database instead. Task alarms are
   /// one-shot and scheduled from an absolute instant, so an offset match is
   /// sufficient; only recurring rules would need the exact zone for DST.
-  @visibleForTesting
+  ///
+  /// Among zones sharing the offset, one whose abbreviation also matches the
+  /// device's (`PKT`, `CEST`, …) is preferred: it is far more likely to share
+  /// the device's daylight-saving rules, which is what keeps a daily alarm on
+  /// its hour after the clocks change.
   static void configureLocalTimeZone() {
     tz_data.initializeTimeZones();
 
-    final int offsetMillis = DateTime.now().timeZoneOffset.inMilliseconds;
+    final DateTime now = DateTime.now();
+    final int offsetMillis = now.timeZoneOffset.inMilliseconds;
+    final String abbreviation = now.timeZoneName;
+
+    tz.Location? byOffset;
     for (final tz.Location location in tz.timeZoneDatabase.locations.values) {
-      if (location.currentTimeZone.offset == offsetMillis) {
+      final tz.TimeZone zone = location.currentTimeZone;
+      if (zone.offset != offsetMillis) continue;
+      if (zone.abbreviation == abbreviation) {
         tz.setLocalLocation(location);
         return;
       }
+      byOffset ??= location;
     }
 
-    tz.setLocalLocation(tz.UTC);
+    tz.setLocalLocation(byOffset ?? tz.UTC);
   }
 
   /// Asks the OS for notification permission and reports the alarm situation.
@@ -158,6 +200,75 @@ class NotificationService {
         ?.canScheduleExactNotifications();
   }
 
+  /// The most precise scheduling mode the OS will currently allow.
+  ///
+  /// [AndroidScheduleMode.alarmClock] survives Doze and lands on the minute,
+  /// but from Android 12 it needs a permission the user can refuse. Where it
+  /// has been refused the alarm is armed inexactly instead: the OS batches it
+  /// and it may arrive some minutes late, which is worth far more than an
+  /// exception and no reminder at all.
+  ///
+  /// A null answer means the question does not apply — iOS, or Android below
+  /// 12, where exact alarms need no grant — and gets the precise mode.
+  Future<AndroidScheduleMode> resolveScheduleMode() async {
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      return AndroidScheduleMode.alarmClock;
+    }
+    try {
+      final bool? allowed = await canScheduleExactAlarms();
+      return allowed == false
+          ? AndroidScheduleMode.inexact
+          : AndroidScheduleMode.alarmClock;
+    } catch (error) {
+      // An old plugin or an odd ROM: assume the precise mode and let the
+      // arming step fall back if it actually refuses.
+      debugPrint('NotificationService: could not read the exact-alarm state '
+          '(${error.runtimeType}: $error); assuming it is allowed.');
+      return AndroidScheduleMode.alarmClock;
+    }
+  }
+
+  /// Arms one alarm, dropping to inexact if the OS refuses the precise mode.
+  ///
+  /// [resolveScheduleMode] asks first, but the permission can be revoked
+  /// between that answer and this call, and some ROMs refuse regardless. The
+  /// retry is what stops either case surfacing as a failed save.
+  Future<void> _armAlarm({
+    required int id,
+    required String title,
+    required String body,
+    required tz.TZDateTime when,
+    required AndroidScheduleMode mode,
+    required String payload,
+    DateTimeComponents? match,
+  }) async {
+    Future<void> arm(AndroidScheduleMode scheduleMode) {
+      return _plugin.zonedSchedule(
+        id,
+        title,
+        body,
+        when,
+        _details(),
+        androidScheduleMode: scheduleMode,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+        matchDateTimeComponents: match,
+        payload: payload,
+      );
+    }
+
+    try {
+      await arm(mode);
+    } on PlatformException catch (error) {
+      if (mode == AndroidScheduleMode.inexact) rethrow;
+
+      debugPrint('NotificationService: the OS refused an exact alarm for id '
+          '$id (${error.code}); arming it inexactly instead. The reminder '
+          'will arrive, but the OS may batch it a few minutes late.');
+      await arm(AndroidScheduleMode.inexact);
+    }
+  }
+
   /// Opens the system screen that grants exact alarms, and reports the answer.
   ///
   /// This is Android's ACTION_REQUEST_SCHEDULE_EXACT_ALARM: it takes the user
@@ -182,25 +293,24 @@ class NotificationService {
     DateTime scheduledDate, {
     String? body,
     String? payload,
+    AndroidScheduleMode? mode,
   }) async {
-    final tz.TZDateTime when = tz.TZDateTime.from(scheduledDate, tz.local);
+    // Compared as absolute instants, so a UTC or local DateTime lands on the
+    // same moment; the OS fires anything not strictly ahead immediately.
+    final tz.TZDateTime when =
+        tz.TZDateTime.from(scheduledDate.toLocal(), tz.local);
     if (!when.isAfter(tz.TZDateTime.now(tz.local))) {
       return false;
     }
 
     final AppStrings strings = await resolveStrings();
 
-    await _plugin.zonedSchedule(
-      id,
-      title,
-      body ?? defaultBody(scheduledDate, strings),
-      when,
-      _details(),
-      // alarmClock survives Doze and is the mode intended for user-visible
-      // alarms; it is what makes the reminder land on the minute.
-      androidScheduleMode: AndroidScheduleMode.alarmClock,
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
+    await _armAlarm(
+      id: id,
+      title: title,
+      body: body ?? defaultBody(scheduledDate, strings),
+      when: when,
+      mode: mode ?? await resolveScheduleMode(),
       payload: payload ?? id.toString(),
     );
     return true;
@@ -222,15 +332,31 @@ class NotificationService {
     final AppStrings strings = await resolveStrings();
     final String text = body ?? defaultBody(task.scheduledTime, strings);
 
+    // Asked once for the whole task: a weekly repeat arms up to seven alarms
+    // and they all want the same answer.
+    final AndroidScheduleMode mode = await resolveScheduleMode();
+
+    // A repeating alarm starts from its first fire and carries on by itself,
+    // so where it starts is the only thing to decide. Never before the task's
+    // own start date, and never today once today's instance is dealt with —
+    // a finished task must not ring, but tomorrow's still has to.
+    final DateTime today = Task.dayStart(DateTime.now());
+    DateTime firstDay = task.startDay.isAfter(today) ? task.startDay : today;
+    if (task.isRecurring && task.statusOn(today) != TaskStatus.pending) {
+      final DateTime tomorrow = Task.addDays(today, 1);
+      if (firstDay.isBefore(tomorrow)) firstDay = tomorrow;
+    }
+
     switch (task.recurrenceType) {
       case RecurrenceType.daily:
         await _scheduleRepeating(
           id: id,
           title: task.title,
           body: text,
-          when: _nextDailyOccurrence(task.scheduledTime),
+          when: nextDailyOccurrence(task.scheduledTime, notBefore: firstDay),
           match: DateTimeComponents.time,
           payload: id.toString(),
+          mode: mode,
         );
         return 1;
 
@@ -242,9 +368,14 @@ class NotificationService {
             id: weeklyNotificationId(id, weekday),
             title: task.title,
             body: text,
-            when: _nextWeekdayOccurrence(task.scheduledTime, weekday),
+            when: nextWeekdayOccurrence(
+              task.scheduledTime,
+              weekday,
+              notBefore: firstDay,
+            ),
             match: DateTimeComponents.dayOfWeekAndTime,
             payload: id.toString(),
+            mode: mode,
           );
           armed++;
         }
@@ -256,6 +387,7 @@ class NotificationService {
           task.title,
           task.scheduledTime,
           body: text,
+          mode: mode,
         );
         return scheduled ? 1 : 0;
     }
@@ -294,50 +426,64 @@ class NotificationService {
     required tz.TZDateTime when,
     required DateTimeComponents match,
     required String payload,
+    required AndroidScheduleMode mode,
   }) {
-    return _plugin.zonedSchedule(
-      id,
-      title,
-      body,
-      when,
-      _details(),
-      androidScheduleMode: AndroidScheduleMode.alarmClock,
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
-      matchDateTimeComponents: match,
+    return _armAlarm(
+      id: id,
+      title: title,
+      body: body,
+      when: when,
+      mode: mode,
+      match: match,
       payload: payload,
     );
   }
 
-  /// Today at the task's time, or tomorrow if that moment has passed.
-  static tz.TZDateTime _nextDailyOccurrence(DateTime scheduledTime) {
+  /// The first moment at the task's time of day that is strictly in the
+  /// future and on or after [notBefore]'s day (today when omitted).
+  ///
+  /// Days are stepped on the calendar rather than by adding 24 hours: across
+  /// a daylight-saving change the latter lands an hour off the task's time.
+  @visibleForTesting
+  static tz.TZDateTime nextDailyOccurrence(
+    DateTime scheduledTime, {
+    DateTime? notBefore,
+    int? weekday,
+  }) {
     final tz.TZDateTime now = tz.TZDateTime.now(tz.local);
-    tz.TZDateTime candidate = tz.TZDateTime(
-      tz.local,
-      now.year,
-      now.month,
-      now.day,
-      scheduledTime.hour,
-      scheduledTime.minute,
-    );
-    if (!candidate.isAfter(now)) {
-      candidate = candidate.add(const Duration(days: 1));
+    final DateTime local = scheduledTime.toLocal();
+    final DateTime from = notBefore == null
+        ? DateTime(now.year, now.month, now.day)
+        : Task.dayStart(notBefore);
+
+    // At most eight hops: today may be past, then up to a week to the weekday.
+    for (int offset = 0; ; offset++) {
+      final tz.TZDateTime candidate = tz.TZDateTime(
+        tz.local,
+        from.year,
+        from.month,
+        from.day + offset,
+        local.hour,
+        local.minute,
+      );
+      if (!candidate.isAfter(now)) continue;
+      if (weekday != null && candidate.weekday != weekday) continue;
+      return candidate;
     }
-    return candidate;
   }
 
   /// The next occurrence of [weekday] at the task's time.
-  static tz.TZDateTime _nextWeekdayOccurrence(
+  @visibleForTesting
+  static tz.TZDateTime nextWeekdayOccurrence(
     DateTime scheduledTime,
-    int weekday,
-  ) {
-    tz.TZDateTime candidate = _nextDailyOccurrence(scheduledTime);
-    // At most seven hops to land on the requested weekday.
-    while (candidate.weekday != weekday) {
-      candidate = candidate.add(const Duration(days: 1));
-    }
-    return candidate;
-  }
+    int weekday, {
+    DateTime? notBefore,
+  }) =>
+      nextDailyOccurrence(
+        scheduledTime,
+        notBefore: notBefore,
+        weekday: weekday,
+      );
 
   /// Cancels every alarm belonging to task [id].
   ///
@@ -349,6 +495,23 @@ class NotificationService {
     await _plugin.cancel(id);
     for (int weekday = 1; weekday <= 7; weekday++) {
       await _plugin.cancel(weeklyNotificationId(id, weekday));
+    }
+  }
+
+  /// [cancelNotification], with a failure logged instead of thrown.
+  ///
+  /// For paths where the alarm is secondary to a database write: a plugin
+  /// that throws must never be what stops a delete from happening, or the
+  /// task comes straight back on the next reload.
+  Future<bool> tryCancelNotification(int id) async {
+    try {
+      await cancelNotification(id);
+      return true;
+    } catch (error, stack) {
+      debugPrint('NotificationService: could not cancel alarms for task $id '
+          'with ${error.runtimeType}: $error');
+      debugPrintStack(stackTrace: stack, label: 'NotificationService');
+      return false;
     }
   }
 
@@ -365,6 +528,11 @@ class NotificationService {
         channelId,
         channelName,
         channelDescription: channelDescription,
+        // Both are needed for a heads-up alert: importance sets the channel's
+        // ceiling, which Android fixes at creation and the app cannot raise
+        // later, and priority decides how this particular notification is
+        // shown within it. Anything less and a task reminder lands silently
+        // in the shade, which for an alarm is the same as not arriving.
         importance: Importance.max,
         priority: Priority.high,
         category: AndroidNotificationCategory.alarm,

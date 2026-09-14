@@ -16,26 +16,37 @@ enum ReportRange {
   final String englishLabel;
 
   /// First instant included, at midnight.
+  ///
+  /// Calendar arithmetic throughout: subtracting 24-hour durations drifts an
+  /// hour off midnight across a daylight-saving change.
   DateTime start(DateTime now) {
-    final DateTime midnight = DateTime(now.year, now.month, now.day);
+    final DateTime local = now.toLocal();
     switch (this) {
       case ReportRange.today:
-        return midnight;
+        return Task.dayStart(local);
       case ReportRange.lastThreeDays:
         // Today plus the two days before it.
-        return midnight.subtract(const Duration(days: 2));
+        return Task.addDays(local, -2);
       case ReportRange.thisWeek:
         // ISO weeks start on Monday; DateTime.weekday is 1 for Monday.
-        return midnight.subtract(Duration(days: now.weekday - 1));
+        return Task.addDays(local, -(local.weekday - 1));
     }
   }
 
   /// Exclusive upper bound: midnight tonight.
-  DateTime end(DateTime now) =>
-      DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
+  DateTime end(DateTime now) => Task.addDays(now, 1);
 
   /// How many whole days the range spans for [now].
-  int dayCount(DateTime now) => end(now).difference(start(now)).inDays;
+  ///
+  /// Counted on the calendar, since a range containing the clocks going back
+  /// is 25 hours longer than its days and `inDays` would round wrongly.
+  int dayCount(DateTime now) {
+    final DateTime from = start(now);
+    final DateTime to = end(now);
+    return DateTime.utc(to.year, to.month, to.day)
+        .difference(DateTime.utc(from.year, from.month, from.day))
+        .inDays;
+  }
 }
 
 /// Counts of each status over a range, ready for the summary row.

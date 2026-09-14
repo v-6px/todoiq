@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/timezone.dart' as tz;
 
+import 'package:todo_list/models/task_model.dart';
 import 'package:todo_list/services/notification_service.dart';
 import 'package:todo_list/services/settings_service.dart';
 
@@ -29,9 +30,14 @@ void main() {
 
   late NotificationService service;
 
+  /// Makes the fake OS refuse anything but an inexact alarm at arming time,
+  /// the way a device does when the permission was revoked after the check.
+  bool refuseExactAlarmOnSchedule = false;
+
   setUp(() {
     calls.clear();
     pending.clear();
+    refuseExactAlarmOnSchedule = false;
 
     // Scheduling reads the UI language to word the notification body, so a
     // preference store has to exist. Pinned to English so the body assertions
@@ -66,6 +72,16 @@ void main() {
         case 'zonedSchedule':
           final Map<Object?, Object?> args =
               call.arguments as Map<Object?, Object?>;
+          final Map<Object?, Object?> specifics =
+              (args['platformSpecifics'] ?? <Object?, Object?>{})
+                  as Map<Object?, Object?>;
+          if (refuseExactAlarmOnSchedule &&
+              specifics['scheduleMode'] != AndroidScheduleMode.inexact.name) {
+            throw PlatformException(
+              code: 'exact_alarms_not_permitted',
+              message: 'Exact alarms are not permitted',
+            );
+          }
           pending[args['id']! as int] = args;
           return null;
         case 'cancel':
@@ -141,6 +157,120 @@ void main() {
 
       expect(calls.length, callsAfterFirst,
           reason: 'a second init() should do no work');
+    });
+  });
+
+  /// The mode the fake OS was handed for alarm [id].
+  String? scheduleModeOf(int id) {
+    final Map<Object?, Object?> specifics =
+        pending[id]!['platformSpecifics']! as Map<Object?, Object?>;
+    return specifics['scheduleMode'] as String?;
+  }
+
+  group('Exact alarm fallback', () {
+    test('the precise mode is used when the OS allows it', () async {
+      exactAlarmsPermissionResult = true;
+
+      expect(
+        await service.resolveScheduleMode(),
+        AndroidScheduleMode.alarmClock,
+      );
+    });
+
+    test('a refusal drops to inexact rather than failing', () async {
+      // The alternative is an exception and no reminder at all. A few minutes
+      // late beats never.
+      exactAlarmsPermissionResult = false;
+
+      expect(
+        await service.resolveScheduleMode(),
+        AndroidScheduleMode.inexact,
+      );
+    });
+
+    test('an unknown answer keeps the precise mode', () async {
+      // Android below 12 answers null: exact alarms need no grant there, so
+      // an unknown must never be read as a refusal.
+      exactAlarmsPermissionResult = null;
+
+      expect(
+        await service.resolveScheduleMode(),
+        AndroidScheduleMode.alarmClock,
+      );
+    });
+
+    test('a task scheduled without the permission still arms an alarm',
+        () async {
+      exactAlarmsPermissionResult = false;
+
+      final int armed = await service.scheduleForTask(Task(
+        id: 31,
+        title: 'Dentist',
+        scheduledTime: DateTime.now().add(const Duration(days: 1)),
+      ));
+
+      expect(armed, 1, reason: 'the reminder is still set');
+      expect(pending, hasLength(1));
+      expect(scheduleModeOf(31), AndroidScheduleMode.inexact.name);
+    });
+
+    test('an OS that refuses at the last moment is retried inexactly',
+        () async {
+      // The permission can be revoked between the check and the call, and
+      // some ROMs refuse whatever the check said.
+      exactAlarmsPermissionResult = true;
+      refuseExactAlarmOnSchedule = true;
+
+      final int armed = await service.scheduleForTask(Task(
+        id: 32,
+        title: 'Dentist',
+        scheduledTime: DateTime.now().add(const Duration(days: 1)),
+      ));
+
+      expect(armed, 1);
+      expect(
+        scheduleModeOf(32),
+        AndroidScheduleMode.inexact.name,
+        reason: 'the retry is what stops this surfacing as a failed save',
+      );
+    });
+
+    test('every weekday of a weekly task falls back together', () async {
+      exactAlarmsPermissionResult = false;
+
+      final int armed = await service.scheduleForTask(Task(
+        id: 33,
+        title: 'Gym',
+        scheduledTime: DateTime.now().add(const Duration(days: 1)),
+        recurrenceType: RecurrenceType.weeklyDays,
+        repeatDays: <int>[1, 3, 5],
+      ));
+
+      expect(armed, 3);
+      for (final int id in pending.keys) {
+        expect(scheduleModeOf(id), AndroidScheduleMode.inexact.name);
+      }
+    });
+  });
+
+  group('Notification channel', () {
+    test('alarms are configured to interrupt, not to sit in the shade',
+        () async {
+      await service.scheduleNotification(
+        41,
+        'Dentist',
+        DateTime.now().add(const Duration(days: 1)),
+      );
+
+      final Map<Object?, Object?> details =
+          pending[41]!['platformSpecifics']! as Map<Object?, Object?>;
+
+      // Importance fixes the channel's ceiling at creation and cannot be
+      // raised later; priority decides how this notification shows within it.
+      // Anything less and a task alarm arrives silently.
+      expect(details['importance'], Importance.max.value);
+      expect(details['priority'], Priority.high.value);
+      expect(details['channelId'], NotificationService.channelId);
     });
   });
 

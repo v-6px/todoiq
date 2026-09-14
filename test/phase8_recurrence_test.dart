@@ -118,7 +118,11 @@ void main() {
     return MaterialApp(
       theme: AppTheme.forLocale(Locale(language)),
       locale: Locale(language),
-      supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+      supportedLocales: const <Locale>[
+        Locale('en'),
+        Locale('ar'),
+        Locale('fr'),
+      ],
       localizationsDelegates: const <LocalizationsDelegate<Object>>[
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,

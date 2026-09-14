@@ -29,6 +29,13 @@ class AddTaskSheet extends StatefulWidget {
   /// The day the sheet opens on. Defaults to today.
   final DateTime? day;
 
+  /// The real today, which the "Today" and "Tomorrow" chips mean.
+  ///
+  /// Separate from [day]: opened while browsing Monday on a Tuesday, the
+  /// form starts on Monday but "Today" must still mean Tuesday. Defaults to
+  /// the device's local date.
+  final DateTime? today;
+
   /// The task being edited, or null to create a new one.
   ///
   /// One sheet for both jobs: the fields, the validation and the alarm
@@ -36,13 +43,14 @@ class AddTaskSheet extends StatefulWidget {
   /// inserts a row or replaces one.
   final Task? task;
 
-  const AddTaskSheet({super.key, this.day, this.task});
+  const AddTaskSheet({super.key, this.day, this.today, this.task});
 
   /// Opens the sheet and resolves to the created or updated task, or null if
   /// it was dismissed. Pass [task] to open in edit mode.
   static Future<Task?> show(
     BuildContext context, {
     DateTime? day,
+    DateTime? today,
     Task? task,
   }) {
     return showModalBottomSheet<Task>(
@@ -54,7 +62,8 @@ class AddTaskSheet extends StatefulWidget {
           top: Radius.circular(AppRadius.xl),
         ),
       ),
-      builder: (BuildContext context) => AddTaskSheet(day: day, task: task),
+      builder: (BuildContext context) =>
+          AddTaskSheet(day: day, today: today, task: task),
     );
   }
 
@@ -96,7 +105,8 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
   bool _saving = false;
 
   /// Today at midnight, captured once so the quick chips stay stable.
-  late final DateTime _today = Task.dayStart(widget.day ?? DateTime.now());
+  late final DateTime _today =
+      Task.dayStart(widget.today ?? DateTime.now().toLocal());
 
   bool get _isEditing => widget.task != null;
 
@@ -119,11 +129,11 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
       return;
     }
 
-    _date = _today;
+    _date = widget.day == null ? _today : Task.dayStart(widget.day!);
 
     // Default to the next round half hour — the most common intent is
     // "soon", and it saves a trip through the picker.
-    final DateTime now = DateTime.now();
+    final DateTime now = DateTime.now().toLocal();
     final DateTime rounded = now.minute < 30
         ? DateTime(now.year, now.month, now.day, now.hour, 30)
         : DateTime(now.year, now.month, now.day, now.hour + 1);
@@ -165,8 +175,8 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
       initialDate: _date,
       // A year back covers logging something missed; two years forward is
       // more than enough runway for a planned task.
-      firstDate: _today.subtract(const Duration(days: 365)),
-      lastDate: _today.add(const Duration(days: 730)),
+      firstDate: Task.addDays(_today, -365),
+      lastDate: Task.addDays(_today, 730),
     );
     if (picked != null && mounted) {
       setState(() => _date = Task.dayStart(picked));
@@ -266,7 +276,20 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
     // trySchedule arms one alarm, a daily repeat, or one per weekday — and
     // declines a one-off whose time has already passed. Null means the OS
     // refused; the task itself is still saved.
-    final int? armed = await NotificationService.instance.trySchedule(saved);
+    // A recurring task is armed as it stands today, so an edit made from
+    // another day's view does not bring back an alarm for an instance today
+    // that is already finished.
+    Task toArm = saved;
+    if (saved.isRecurring) {
+      try {
+        toArm = await DatabaseService.instance
+                .getTaskOnDate(saved.id!, DateTime.now()) ??
+            saved;
+      } catch (_) {
+        // Arming from the object in hand is still better than no alarm.
+      }
+    }
+    final int? armed = await NotificationService.instance.trySchedule(toArm);
 
     if (!mounted) return;
     if (armed == null) {
@@ -393,7 +416,7 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
   }
 
   Widget _dateChips(AppStrings strings) {
-    final DateTime tomorrow = _today.add(const Duration(days: 1));
+    final DateTime tomorrow = Task.addDays(_today, 1);
     final bool isCustom = _date != _today && _date != tomorrow;
 
     return Wrap(

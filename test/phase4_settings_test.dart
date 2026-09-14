@@ -59,7 +59,11 @@ void main() {
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.forLocale(Locale(language)),
       locale: Locale(language),
-      supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+      supportedLocales: const <Locale>[
+        Locale('en'),
+        Locale('ar'),
+        Locale('fr'),
+      ],
       localizationsDelegates: const <LocalizationsDelegate<Object>>[
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -430,7 +434,7 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('sends a 2-token ping to {base_url}/chat/completions', (
+    testWidgets('sends a minimal ping to {base_url}/chat/completions', (
       WidgetTester tester,
     ) async {
       await pumpSettings(tester, client: respondWith(200));
@@ -453,8 +457,75 @@ void main() {
       final Map<String, Object?> body =
           jsonDecode(request.body) as Map<String, Object?>;
       expect(body['model'], 'gemini-3.6-flash');
-      expect(body['max_tokens'], 2);
+      expect(body['max_tokens'], AiService.pingMaxTokens);
       expect(body['messages'], isA<List<Object?>>());
+
+      // Exactly the three standard fields and nothing else. Anything extra
+      // is a field some provider validates strictly and rejects with a 400,
+      // which then reads as "the key is wrong" to the user.
+      expect(
+        body.keys.toSet(),
+        <String>{'model', 'messages', 'max_tokens'},
+        reason: 'the ping must carry no vendor extensions',
+      );
+      expect(body.containsKey('max_completion_tokens'), isFalse);
+      expect(body.containsKey('temperature'), isFalse);
+
+      final List<Object?> messages = body['messages']! as List<Object?>;
+      expect(messages, hasLength(1));
+      expect(
+        messages.single,
+        <String, String>{'role': 'user', 'content': 'ping'},
+      );
+    });
+
+    testWidgets('a rejection shows what the server actually said', (
+      WidgetTester tester,
+    ) async {
+      // The whole point: a 400 that says only "request rejected" sends the
+      // user hunting through settings that are already correct.
+      await pumpSettings(
+        tester,
+        client: MockClient((http.Request request) async {
+          requests.add(request);
+          return http.Response(
+            jsonEncode(<String, Object?>{
+              'error': <String, Object?>{
+                'code': 400,
+                'message': 'Unknown name "max_completion_tokens": Cannot find '
+                    'field.',
+                'status': 'INVALID_ARGUMENT',
+              },
+            }),
+            400,
+            headers: <String, String>{'content-type': 'application/json'},
+          );
+        }),
+      );
+      await fillCredentials(tester);
+      await tapTest(tester);
+
+      expect(find.textContaining('HTTP 400'), findsOneWidget);
+      expect(
+        find.textContaining('Unknown name "max_completion_tokens"'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a non-JSON rejection is still shown verbatim', (
+      WidgetTester tester,
+    ) async {
+      await pumpSettings(
+        tester,
+        client: MockClient((http.Request request) async {
+          requests.add(request);
+          return http.Response('<html><body>502 Bad Gateway</body></html>', 502);
+        }),
+      );
+      await fillCredentials(tester);
+      await tapTest(tester);
+
+      expect(find.textContaining('502 Bad Gateway'), findsOneWidget);
     });
 
     testWidgets('reports success on 200', (WidgetTester tester) async {

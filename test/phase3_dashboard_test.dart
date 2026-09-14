@@ -175,7 +175,11 @@ void main() {
     return MaterialApp(
       theme: AppTheme.forLocale(Locale(language)),
       locale: Locale(language),
-      supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+      supportedLocales: const <Locale>[
+        Locale('en'),
+        Locale('ar'),
+        Locale('fr'),
+      ],
       localizationsDelegates: const <LocalizationsDelegate<Object>>[
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -355,7 +359,7 @@ void main() {
       expect(find.byKey(HomeScreen.chatKey), findsOneWidget);
       expect(find.byKey(HomeScreen.settingsKey), findsOneWidget);
       expect(find.byIcon(Icons.auto_graph_outlined), findsOneWidget);
-      expect(find.byIcon(Icons.chat_bubble_outline), findsOneWidget);
+      expect(find.byIcon(Icons.assistant_outlined), findsOneWidget);
       expect(find.byIcon(Icons.settings_outlined), findsOneWidget);
     });
 
@@ -997,6 +1001,294 @@ void main() {
 
       expect(find.text('التذكيرات معطّلة'), findsOneWidget);
       expect(find.text('السماح بالمنبّهات'), findsOneWidget);
+    });
+  });
+
+  group('Completing a task', () {
+    testWidgets('the checkmark completes it, and does not open the editor', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      await tester.tap(find.byKey(TaskCard.completeKey));
+      await settle(tester);
+
+      final List<Task> stored = await readToday(tester);
+      expect(stored.single.status, TaskStatus.completed);
+      expect(find.byType(AddTaskSheet), findsNothing);
+    });
+
+    testWidgets('a tap that lands just off the checkmark still completes', (
+      WidgetTester tester,
+    ) async {
+      // The bug this replaces: a card-wide tap gesture sat over the buttons
+      // with HitTestBehavior.opaque, so a thumb landing a few pixels off the
+      // 44px target opened the editor instead of completing the task.
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      final Rect button = tester.getRect(find.byKey(TaskCard.completeKey));
+      await tester.tapAt(Offset(
+        button.center.dx - button.width / 2 + 4,
+        button.center.dy + button.height / 2 - 4,
+      ));
+      await settle(tester);
+
+      expect((await readToday(tester)).single.status, TaskStatus.completed);
+      expect(find.byType(AddTaskSheet), findsNothing);
+    });
+
+    testWidgets('nothing over the status buttons competes for the tap', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      // No gesture detector may sit between a status button and the card.
+      final Finder gestures = find.ancestor(
+        of: find.byKey(TaskCard.completeKey),
+        matching: find.byType(GestureDetector),
+      );
+      expect(
+        gestures.evaluate().where((Element e) {
+          final GestureDetector g = e.widget as GestureDetector;
+          return g.onTap != null || g.onLongPress != null;
+        }),
+        isEmpty,
+        reason: 'a tap here must only ever change the status',
+      );
+    });
+
+    testWidgets('a completed task is struck through and faded', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+      await tester.tap(find.byKey(TaskCard.completeKey));
+      await settle(tester);
+
+      final Text title = tester.widget<Text>(find.text('Dentist'));
+      expect(title.style!.decoration, TextDecoration.lineThrough);
+
+      final Opacity faded = tester.widget<Opacity>(
+        find
+            .ancestor(of: find.text('Dentist'), matching: find.byType(Opacity))
+            .first,
+      );
+      expect(faded.opacity, lessThan(1.0));
+    });
+
+    testWidgets('a pending task is neither struck through nor faded', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      final Text title = tester.widget<Text>(find.text('Dentist'));
+      expect(title.style!.decoration, isNot(TextDecoration.lineThrough));
+
+      final Opacity faded = tester.widget<Opacity>(
+        find
+            .ancestor(of: find.text('Dentist'), matching: find.byType(Opacity))
+            .first,
+      );
+      expect(faded.opacity, 1.0);
+    });
+
+    testWidgets('completed tasks sink below the ones still to do', (
+      WidgetTester tester,
+    ) async {
+      // Seeded out of order on purpose: the earliest is the one completed.
+      await seedTask(tester, 'Early done', when: at(7),
+          status: TaskStatus.completed);
+      await seedTask(tester, 'Midday open', when: at(12));
+      await seedTask(tester, 'Late open', when: at(18));
+
+      final List<Task> ordered = await readToday(tester);
+      expect(
+        ordered.map((Task t) => t.title).toList(),
+        <String>['Midday open', 'Late open', 'Early done'],
+      );
+
+      await pumpHome(tester);
+      expect(
+        tester.getCenter(find.text('Early done')).dy,
+        greaterThan(tester.getCenter(find.text('Late open')).dy),
+      );
+    });
+
+    testWidgets('partial and skipped keep their place in the timeline', (
+      WidgetTester tester,
+    ) async {
+      // Only completed sinks. A skipped task is what the day went wrong on,
+      // so it stays where it happened.
+      await seedTask(tester, 'Skipped early', when: at(7),
+          status: TaskStatus.skipped);
+      await seedTask(tester, 'Open later', when: at(18));
+
+      expect(
+        (await readToday(tester)).map((Task t) => t.title).toList(),
+        <String>['Skipped early', 'Open later'],
+      );
+    });
+  });
+
+  group('Immediate feedback', () {
+    testWidgets('the strike-through lands on the very next frame', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9));
+      await pumpHome(tester);
+
+      await tester.tap(find.byKey(TaskCard.completeKey));
+      // One frame only. No settle, no waiting on the database, no waiting on
+      // the eight platform-channel calls that cancel the alarm: the point of
+      // the optimistic update is that none of that gates the paint.
+      await tester.pump();
+
+      final Text title = tester.widget<Text>(find.text('Dentist'));
+      expect(
+        title.style!.decoration,
+        TextDecoration.lineThrough,
+        reason: 'the checkmark must not wait on SQLite to show its effect',
+      );
+
+      await settle(tester);
+      expect((await readToday(tester)).single.status, TaskStatus.completed);
+    });
+
+    testWidgets('the reorder happens on that same frame too', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Morning', when: at(8));
+      await seedTask(tester, 'Evening', when: at(20));
+      await pumpHome(tester);
+
+      expect(
+        tester.getCenter(find.text('Morning')).dy,
+        lessThan(tester.getCenter(find.text('Evening')).dy),
+      );
+
+      // Complete the first one; it should drop below the other immediately.
+      await tester.tap(find.byKey(TaskCard.completeKey).first);
+      await tester.pump();
+
+      expect(
+        tester.getCenter(find.text('Morning')).dy,
+        greaterThan(tester.getCenter(find.text('Evening')).dy),
+        reason: 'a finished task sinks without waiting for a reload',
+      );
+    });
+
+    testWidgets('undoing a completion repaints immediately as well', (
+      WidgetTester tester,
+    ) async {
+      await seedTask(tester, 'Dentist', when: at(9),
+          status: TaskStatus.completed);
+      await pumpHome(tester);
+
+      // Tapping the status a task already has is the undo.
+      await tester.tap(find.byKey(TaskCard.completeKey));
+      await tester.pump();
+
+      final Text title = tester.widget<Text>(find.text('Dentist'));
+      expect(title.style!.decoration, isNot(TextDecoration.lineThrough));
+
+      await settle(tester);
+      expect((await readToday(tester)).single.status, TaskStatus.pending);
+    });
+
+    testWidgets('the optimistic state matches what the database ends up with',
+        (WidgetTester tester) async {
+      await seedTask(tester, 'Morning', when: at(8));
+      await seedTask(tester, 'Midday', when: at(12));
+      await seedTask(tester, 'Evening', when: at(20));
+      await pumpHome(tester);
+
+      await tester.tap(find.byKey(TaskCard.completeKey).first);
+      await tester.pump();
+
+      final List<String> painted = tester
+          .widgetList<TaskCard>(find.byType(TaskCard))
+          .map((TaskCard c) => c.task.title)
+          .toList();
+
+      // Once everything settles, the reload must agree with what was shown —
+      // otherwise the list visibly rearranges itself a second time.
+      await settle(tester);
+      final List<String> reloaded = tester
+          .widgetList<TaskCard>(find.byType(TaskCard))
+          .map((TaskCard c) => c.task.title)
+          .toList();
+
+      expect(painted, reloaded);
+      expect(
+        reloaded,
+        (await readToday(tester)).map((Task t) => t.title).toList(),
+      );
+    });
+  });
+
+  group('Adding a task leaves the others alone', () {
+    testWidgets('inserting does not touch any existing row', (
+      WidgetTester tester,
+    ) async {
+      final int keptId = await seedTask(tester, 'Existing', when: at(8));
+      final int doneId = await seedTask(tester, 'Already done', when: at(9),
+          status: TaskStatus.completed);
+      final int skippedId = await seedTask(tester, 'Already skipped',
+          when: at(10), status: TaskStatus.skipped);
+
+      final List<Task> before = await readToday(tester);
+
+      await pumpHome(tester);
+      await tester.tap(find.byKey(HomeScreen.addTaskKey));
+      await settle(tester);
+      await tester.enterText(
+        find.byKey(AddTaskSheet.titleFieldKey),
+        'Brand new',
+      );
+      await tester.tap(find.byKey(AddTaskSheet.saveButtonKey));
+      await settle(tester);
+
+      final List<Task> after = await readToday(tester);
+      expect(after, hasLength(before.length + 1));
+
+      Task byId(List<Task> list, int id) =>
+          list.firstWhere((Task t) => t.id == id);
+
+      for (final int id in <int>[keptId, doneId, skippedId]) {
+        final Task was = byId(before, id);
+        final Task now = byId(after, id);
+        expect(now.title, was.title, reason: 'title changed on $id');
+        expect(now.status, was.status, reason: 'status changed on $id');
+        expect(now.scheduledTime, was.scheduledTime, reason: 'time on $id');
+        expect(now.note, was.note, reason: 'note on $id');
+        expect(now.recurrenceType, was.recurrenceType);
+      }
+
+      // And specifically: nothing was struck through by the insert.
+      expect(byId(after, keptId).status, TaskStatus.pending);
+      expect(find.text('Brand new'), findsOneWidget);
+    });
+
+    testWidgets('the add sheet opens empty, never prefilled from a task', (
+      WidgetTester tester,
+    ) async {
+      // Saving a prefilled sheet would update that task instead of adding
+      // one, which looks exactly like "adding a task changed my old one".
+      await seedTask(tester, 'Existing', when: at(8));
+      await pumpHome(tester);
+      await tester.tap(find.byKey(HomeScreen.addTaskKey));
+      await settle(tester);
+
+      final TextField field = tester.widget<TextField>(
+        find.byKey(AddTaskSheet.titleFieldKey),
+      );
+      expect(field.controller!.text, isEmpty);
+      expect(find.text('New task'), findsWidgets);
+      expect(find.text('Edit task'), findsNothing);
     });
   });
 

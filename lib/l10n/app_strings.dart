@@ -1,21 +1,40 @@
 import 'package:flutter/widgets.dart';
 
-/// Every user-facing string, in English and Arabic.
+import '../models/ai_failure.dart';
+
+/// Every user-facing string, in English, Arabic and French.
 ///
 /// Hand-written rather than generated: the app has one screen's worth of
-/// strings per phase and no translator pipeline, so an abstract class with two
-/// implementations keeps everything type-checked without adding codegen.
+/// strings per phase and no translator pipeline, so an abstract class with one
+/// implementation per language keeps everything type-checked without adding
+/// codegen. Adding a language means implementing every member — the compiler
+/// will not let a translation ship half-finished.
 abstract class AppStrings {
   const AppStrings();
 
   /// The languages the app offers.
-  static const List<String> supportedLanguageCodes = <String>['en', 'ar'];
+  static const List<String> supportedLanguageCodes = <String>[
+    'en',
+    'ar',
+    'fr',
+  ];
 
   static const AppStrings en = _EnStrings();
   static const AppStrings ar = _ArStrings();
+  static const AppStrings fr = _FrStrings();
 
-  static AppStrings forLanguage(String languageCode) =>
-      languageCode == 'ar' ? ar : en;
+  /// Strings for [languageCode], falling back to English for anything the
+  /// app does not carry.
+  static AppStrings forLanguage(String languageCode) {
+    switch (languageCode) {
+      case 'ar':
+        return ar;
+      case 'fr':
+        return fr;
+      default:
+        return en;
+    }
+  }
 
   static AppStrings forLocale(Locale locale) =>
       forLanguage(locale.languageCode);
@@ -128,6 +147,7 @@ abstract class AppStrings {
   String get settingsPrivacyNote;
   String get languageEnglish;
   String get languageArabic;
+  String get languageFrench;
 
   String contactingEndpoint(String baseUrl);
   String connectedTo(String model);
@@ -152,14 +172,19 @@ abstract class AppStrings {
   /// Caption over a stored debrief, e.g. "Generated 12 Sep, 14:30".
   String reportGeneratedAt(String when);
 
-  // Section headings the model is told to write. Localised so an Arabic
-  // debrief does not come back with English headings stranded in an
-  // otherwise right-to-left document.
+  // Section headings the model is told to write, verbatim. Localised so an
+  // Arabic debrief does not come back with English headings stranded in an
+  // otherwise right-to-left document. The emoji that precede them live in
+  // DebriefService, so every language carries the same three marks.
   String get reportHeadingSummary;
   String get reportHeadingBottlenecks;
   String get reportHeadingNextSteps;
   String get openSettings;
   String get debriefFailed;
+
+  /// A short, friendly explanation of an AI failure — never the provider's
+  /// raw error body.
+  String aiFailure(AiFailure kind);
 
   // --- Coach ------------------------------------------------------------
   String get coachTitle;
@@ -176,6 +201,8 @@ abstract class AppStrings {
   String get coachTaskAdded;
   String get coachTaskAddFailed;
   String get coachProposedTask;
+  String get clearChat;
+  String get chatCleared;
 
   // --- Notifications ----------------------------------------------------
   /// Body shown under the task title in the alarm, e.g. "Scheduled for 14:30".
@@ -212,7 +239,7 @@ class _EnStrings extends AppStrings {
   @override
   String get aiReports => 'AI reports';
   @override
-  String get aiCoach => 'AI coach';
+  String get aiCoach => 'Personal Assistant';
   @override
   String get settings => 'Settings';
   @override
@@ -356,11 +383,13 @@ class _EnStrings extends AppStrings {
   @override
   String get settingsPrivacyNote =>
       'Tasks, alarms and history stay on this device. These credentials are '
-      'only used for the AI debrief and coach.';
+      'only used for the AI debrief and the assistant.';
   @override
   String get languageEnglish => 'English';
   @override
   String get languageArabic => 'العربية';
+  @override
+  String get languageFrench => 'Français';
 
   @override
   String contactingEndpoint(String baseUrl) => 'Contacting $baseUrl…';
@@ -404,20 +433,46 @@ class _EnStrings extends AppStrings {
   @override
   String reportGeneratedAt(String when) => 'Generated $when';
   @override
-  String get reportHeadingSummary => 'Summary';
+  String get reportHeadingSummary => 'Completion summary';
   @override
-  String get reportHeadingBottlenecks => 'Obstacles';
+  String get reportHeadingBottlenecks => 'Where it broke down';
   @override
-  String get reportHeadingNextSteps => 'Tomorrow\u2019s steps';
+  String get reportHeadingNextSteps => 'Correction plan for tomorrow';
   @override
   String get openSettings => 'Open Settings';
   @override
   String get debriefFailed => 'Something went wrong generating the debrief.';
+  @override
+  String aiFailure(AiFailure kind) {
+    switch (kind) {
+      case AiFailure.missingConfiguration:
+        return 'Add your API key, base URL and model in Settings first.';
+      case AiFailure.invalidUrl:
+        return 'The base URL in Settings is not a valid address.';
+      case AiFailure.unauthorized:
+        return 'Your API key was not accepted. Check it in Settings.';
+      case AiFailure.notFound:
+        return 'The service or model was not found. Check the base URL and '
+            'model name in Settings.';
+      case AiFailure.rateLimited:
+        return 'Too many requests right now. Wait a minute and try again.';
+      case AiFailure.unavailable:
+        return 'The AI service is busy at the moment. Please try again in a '
+            'little while.';
+      case AiFailure.network:
+        return 'Could not connect. Check your internet connection and try '
+            'again.';
+      case AiFailure.emptyResponse:
+      case AiFailure.other:
+        return 'The report could not be generated this time. Please try '
+            'again.';
+    }
+  }
 
   @override
-  String get coachTitle => 'Coach';
+  String get coachTitle => 'Personal Assistant';
   @override
-  String get coachEmptyTitle => 'Your coach has today\'s log.';
+  String get coachEmptyTitle => 'Your assistant has today\'s log.';
   @override
   String get coachEmptyHint =>
       'Ask what went wrong, or what to do with the time that is left.';
@@ -439,6 +494,10 @@ class _EnStrings extends AppStrings {
   String get coachTaskAddFailed => 'Could not add the task. Try again.';
   @override
   String get coachProposedTask => 'Suggested task';
+  @override
+  String get clearChat => 'Clear chat';
+  @override
+  String get chatCleared => 'Conversation cleared.';
 
   @override
   String notificationBody(String time) => 'Scheduled for $time';
@@ -473,7 +532,7 @@ class _ArStrings extends AppStrings {
   @override
   String get aiReports => 'التقارير';
   @override
-  String get aiCoach => 'المدرّب';
+  String get aiCoach => 'المساعد الشخصي';
   @override
   String get settings => 'الإعدادات';
   @override
@@ -617,11 +676,13 @@ class _ArStrings extends AppStrings {
   @override
   String get settingsPrivacyNote =>
       'المهام والمنبّهات والسجلّ تبقى على هذا الجهاز. تُستخدم بيانات '
-      'الاعتماد هذه للتقارير والمدرّب فقط.';
+      'الاعتماد هذه للتقارير والمساعد الشخصي فقط.';
   @override
   String get languageEnglish => 'English';
   @override
   String get languageArabic => 'العربية';
+  @override
+  String get languageFrench => 'Français';
 
   @override
   String contactingEndpoint(String baseUrl) => 'جارٍ الاتصال بـ $baseUrl…';
@@ -664,20 +725,44 @@ class _ArStrings extends AppStrings {
   @override
   String reportGeneratedAt(String when) => 'أُنشئت في $when';
   @override
-  String get reportHeadingSummary => 'الملخص';
+  String get reportHeadingSummary => 'خلاصة الإنجاز';
   @override
-  String get reportHeadingBottlenecks => 'المعوقات';
+  String get reportHeadingBottlenecks => 'نقاط التعثر والخلل';
   @override
-  String get reportHeadingNextSteps => 'خطوات الغد';
+  String get reportHeadingNextSteps => 'خطة الضبط لليوم القادم';
   @override
   String get openSettings => 'فتح الإعدادات';
   @override
   String get debriefFailed => 'تعذّر إنشاء الحصيلة.';
+  @override
+  String aiFailure(AiFailure kind) {
+    switch (kind) {
+      case AiFailure.missingConfiguration:
+        return 'أضف مفتاح الواجهة البرمجية والرابط والنموذج من الإعدادات أولًا.';
+      case AiFailure.invalidUrl:
+        return 'الرابط الأساسي في الإعدادات غير صالح.';
+      case AiFailure.unauthorized:
+        return 'لم يُقبل مفتاح الواجهة البرمجية. تحقّق منه في الإعدادات.';
+      case AiFailure.notFound:
+        return 'لم يُعثر على الخدمة أو النموذج. تحقّق من الرابط واسم النموذج '
+            'في الإعدادات.';
+      case AiFailure.rateLimited:
+        return 'طلبات كثيرة في وقت قصير. انتظر دقيقة ثم حاول مجددًا.';
+      case AiFailure.unavailable:
+        return 'خدمة الذكاء الاصطناعي مشغولة حاليًا. يُرجى المحاولة مرة أخرى '
+            'بعد قليل.';
+      case AiFailure.network:
+        return 'تعذّر الاتصال. تحقّق من اتصالك بالإنترنت ثم حاول مجددًا.';
+      case AiFailure.emptyResponse:
+      case AiFailure.other:
+        return 'تعذّر إنشاء التقرير هذه المرة. يُرجى المحاولة مرة أخرى.';
+    }
+  }
 
   @override
-  String get coachTitle => 'المدرّب';
+  String get coachTitle => 'المساعد الشخصي';
   @override
-  String get coachEmptyTitle => 'مدرّبك يعرف مهام يومك.';
+  String get coachEmptyTitle => 'مساعدك يعرف مهام يومك.';
   @override
   String get coachEmptyHint =>
       'اسأله عمّا تعثّر، أو كيف تستثمر ما تبقّى من الوقت.';
@@ -701,6 +786,10 @@ class _ArStrings extends AppStrings {
       'تعذّرت إضافة المهمة. حاول مرة أخرى.';
   @override
   String get coachProposedTask => 'مهمة مقترحة';
+  @override
+  String get clearChat => 'مسح المحادثة';
+  @override
+  String get chatCleared => 'تم مسح المحادثة.';
 
   @override
   String notificationBody(String time) => 'موعد المهمة: $time';
@@ -708,4 +797,306 @@ class _ArStrings extends AppStrings {
   @override
   String get replyLanguageInstruction =>
       'أجب بالعربية الفصحى المبسّطة، بأسلوب واضح ومباشر.';
+}
+
+class _FrStrings extends AppStrings {
+  const _FrStrings();
+
+  @override
+  String get languageCode => 'fr';
+
+  @override
+  String get appTitle => 'ToDoIQ';
+  @override
+  String get nothingScheduledToday => 'Rien de prévu aujourd’hui.';
+  @override
+  String get nothingScheduledThisDay => 'Rien de prévu ce jour-là.';
+  @override
+  String get emptyStateHint =>
+      'Ajoutez une première tâche : son alarme sonnera à l’heure, même '
+      'hors connexion.';
+  @override
+  String get newTask => 'Nouvelle tâche';
+  @override
+  String get previousDay => 'Jour précédent';
+  @override
+  String get nextDay => 'Jour suivant';
+  @override
+  String get today => 'Aujourd’hui';
+  @override
+  String get aiReports => 'Bilans IA';
+  @override
+  String get aiCoach => 'Assistant personnel';
+  @override
+  String get settings => 'Réglages';
+  @override
+  String get back => 'Retour';
+
+  @override
+  String summaryNothingScheduled() => 'rien de prévu';
+  @override
+  String summaryAllDone(int total) =>
+      total == 1 ? 'la seule tâche est faite' : 'les $total tâches sont faites';
+  @override
+  String summaryRemaining(int pending, int total) =>
+      '$pending sur $total restantes';
+
+  @override
+  String get statusDone => 'Faite';
+  @override
+  String get statusPartial => 'Partielle';
+  @override
+  String get statusSkipped => 'Passée';
+  @override
+  String get statusPending => 'À faire';
+  @override
+  String get actionComplete => 'Terminer';
+  @override
+  String get actionPartial => 'Avancée partielle';
+  @override
+  String get actionSkip => 'Passer';
+
+  @override
+  String get addTaskTitle => 'Nouvelle tâche';
+  @override
+  String get addTaskHint => 'Qu’y a-t-il à faire ?';
+  @override
+  String get addTaskEmptyError => 'Donnez un nom à la tâche.';
+  @override
+  String get addTaskSaveError =>
+      'Impossible d’enregistrer la tâche. Réessayez.';
+  @override
+  String get taskSavedReminderFailed =>
+      'Tâche enregistrée, mais le rappel n’a pas pu être programmé. '
+      'Vérifiez les autorisations de notifications et d’alarmes.';
+
+  @override
+  String get exactAlarmBannerTitle =>
+      'Les rappels ne peuvent pas être programmés';
+  @override
+  String get exactAlarmBannerBody =>
+      'Android bloque les alarmes exactes pour cette application : vos tâches '
+      'ne vous préviendront pas à l’heure prévue.';
+  @override
+  String get exactAlarmBannerAction => 'Autoriser les alarmes';
+  @override
+  String get exactAlarmBannerDismiss => 'Plus tard';
+  @override
+  String get addTaskButton => 'Ajouter la tâche';
+  @override
+  String get addTaskSaving => 'Enregistrement…';
+  @override
+  String get editTaskTitle => 'Modifier la tâche';
+  @override
+  String get editTaskButton => 'Enregistrer les modifications';
+  @override
+  String get deleteTask => 'Supprimer';
+  @override
+  String get taskDeleted => 'Tâche supprimée';
+  @override
+  String get undo => 'Annuler';
+  @override
+  String get changeTime => 'Modifier';
+  @override
+  String get timeHasPassedNotice =>
+      'Cette heure est passée — la tâche est enregistrée sans rappel.';
+  @override
+  String get dateLabel => 'Date';
+  @override
+  String get timeLabel => 'Heure';
+  @override
+  String get dateToday => 'Aujourd’hui';
+  @override
+  String get dateTomorrow => 'Demain';
+  @override
+  String get datePick => 'Choisir une date';
+  @override
+  String get repeatLabel => 'Répétition';
+  @override
+  String get repeatOnce => 'Une fois';
+  @override
+  String get repeatDaily => 'Chaque jour';
+  @override
+  String get repeatSpecificDays => 'Jours précis';
+  @override
+  String get pickAtLeastOneDay => 'Choisissez au moins un jour.';
+  @override
+  String get repeatsDaily => 'Se répète chaque jour';
+  @override
+  String repeatsOn(String days) => 'Se répète : $days';
+
+  @override
+  String get notePromptPartial => 'Qu’est-ce qui vous a empêché de finir ?';
+  @override
+  String get notePromptSkipped => 'Qu’est-ce qui vous a bloqué ?';
+  @override
+  String get notePromptGeneric => 'Ajoutez une raison courte (facultatif)';
+  @override
+  String get noteHint => 'Manque de temps, en attente d’une relecture…';
+  @override
+  String get noteSave => 'Enregistrer';
+  @override
+  String get noteSkip => 'Passer';
+
+  @override
+  String get settingsProvider => 'Fournisseur';
+  @override
+  String get settingsCredentials => 'Identifiants';
+  @override
+  String get settingsLanguage => 'Langue';
+  @override
+  String get settingsApiKey => 'Clé API';
+  @override
+  String get settingsApiKeyHint => 'sk-…';
+  @override
+  String get settingsBaseUrl => 'URL de base';
+  @override
+  String get settingsBaseUrlHint => 'https://api.example.com/v1';
+  @override
+  String get settingsModel => 'Nom du modèle';
+  @override
+  String get settingsModelHint => 'gemini-3.6-flash';
+  @override
+  String get settingsShowKey => 'Afficher la clé';
+  @override
+  String get settingsHideKey => 'Masquer la clé';
+  @override
+  String get settingsTestConnection => 'Tester la connexion';
+  @override
+  String get settingsTesting => 'Test en cours…';
+  @override
+  String get settingsSave => 'Enregistrer';
+  @override
+  String get settingsSaving => 'Enregistrement…';
+  @override
+  String get settingsSaved => 'Réglages enregistrés.';
+  @override
+  String get settingsPrivacyNote =>
+      'Vos tâches, alarmes et historique restent sur cet appareil. Ces '
+      'identifiants ne servent qu’au bilan et à l’assistant.';
+  @override
+  String get languageEnglish => 'English';
+  @override
+  String get languageArabic => 'العربية';
+  @override
+  String get languageFrench => 'Français';
+
+  @override
+  String contactingEndpoint(String baseUrl) => 'Connexion à $baseUrl…';
+  @override
+  String connectedTo(String model) => 'Connecté. $model a répondu.';
+  @override
+  String get enterApiKeyFirst => 'Saisissez d’abord une clé API.';
+  @override
+  String get enterBaseUrlFirst => 'Saisissez d’abord une URL de base.';
+  @override
+  String get enterModelFirst => 'Saisissez d’abord un nom de modèle.';
+
+  @override
+  String get reportTitle => 'Bilan';
+  @override
+  String get rangeToday => 'Aujourd’hui';
+  @override
+  String get rangeLastThreeDays => '3 derniers jours';
+  @override
+  String get rangeThisWeek => 'Cette semaine';
+  @override
+  String get statCompleted => 'Terminées';
+  @override
+  String get statPartial => 'Partielles';
+  @override
+  String get statSkipped => 'Passées';
+  @override
+  String get generateDebrief => 'Générer le bilan IA';
+  @override
+  String get generatingDebrief => 'Génération…';
+  @override
+  String get noTasksInRange =>
+      'Aucune tâche sur cette période. Ajoutez-en quelques-unes et revenez '
+      'une fois la journée écoulée.';
+  @override
+  String get nothingResolvedYet =>
+      'Aucune tâche n’est encore marquée faite, partielle ou passée — le '
+      'bilan aura peu de matière.';
+  @override
+  String get regenerateDebrief => 'Regénérer';
+  @override
+  String reportGeneratedAt(String when) => 'Généré le $when';
+  @override
+  String get reportHeadingSummary => 'Bilan d\u2019exécution';
+  @override
+  String get reportHeadingBottlenecks => 'Points de blocage';
+  @override
+  String get reportHeadingNextSteps => 'Plan de redressement';
+  @override
+  String get openSettings => 'Ouvrir les réglages';
+  @override
+  String get debriefFailed => 'La génération du bilan a échoué.';
+  @override
+  String aiFailure(AiFailure kind) {
+    switch (kind) {
+      case AiFailure.missingConfiguration:
+        return 'Ajoutez d’abord votre clé API, l’URL et le modèle dans les '
+            'Réglages.';
+      case AiFailure.invalidUrl:
+        return 'L’URL de base dans les Réglages n’est pas une adresse valide.';
+      case AiFailure.unauthorized:
+        return 'Votre clé API a été refusée. Vérifiez-la dans les Réglages.';
+      case AiFailure.notFound:
+        return 'Service ou modèle introuvable. Vérifiez l’URL et le nom du '
+            'modèle dans les Réglages.';
+      case AiFailure.rateLimited:
+        return 'Trop de requêtes pour le moment. Patientez une minute puis '
+            'réessayez.';
+      case AiFailure.unavailable:
+        return 'Le service d’IA est surchargé pour le moment. Réessayez dans '
+            'un instant.';
+      case AiFailure.network:
+        return 'Connexion impossible. Vérifiez votre accès à Internet puis '
+            'réessayez.';
+      case AiFailure.emptyResponse:
+      case AiFailure.other:
+        return 'Le rapport n’a pas pu être généré cette fois. Réessayez.';
+    }
+  }
+
+  @override
+  String get coachTitle => 'Assistant personnel';
+  @override
+  String get coachEmptyTitle =>
+      'Votre assistant connaît vos tâches du jour.';
+  @override
+  String get coachEmptyHint =>
+      'Demandez-lui ce qui a coincé, ou quoi faire du temps qu’il reste.';
+  @override
+  String get coachInputHint => 'Pourquoi la journée a-t-elle calé ?';
+  @override
+  String get coachThinking => 'Réflexion…';
+  @override
+  String get coachGenericError =>
+      'Une erreur est survenue. Réessayez.';
+  @override
+  String get send => 'Envoyer';
+  @override
+  String get coachAddTaskButton => '➕ Ajouter la tâche au planning';
+  @override
+  String get coachAddingTask => 'Ajout…';
+  @override
+  String get coachTaskAdded => 'Tâche ajoutée à votre planning.';
+  @override
+  String get coachTaskAddFailed =>
+      'Impossible d’ajouter la tâche. Réessayez.';
+  @override
+  String get coachProposedTask => 'Tâche suggérée';
+  @override
+  String get clearChat => 'Effacer la conversation';
+  @override
+  String get chatCleared => 'Conversation effacée.';
+
+  @override
+  String notificationBody(String time) => 'Prévu pour $time';
+
+  @override
+  String get replyLanguageInstruction =>
+      'Réponds en français, dans un style clair et direct.';
 }

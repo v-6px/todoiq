@@ -277,8 +277,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  /// Two chips, styled like the provider presets so the screen reads as one
-  /// system.
+  /// One chip per language, styled like the provider presets so the screen
+  /// reads as one system.
   Widget _languageSelector(AppStrings strings) {
     return Wrap(
       spacing: AppSpacing.sm,
@@ -295,6 +295,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           label: strings.languageArabic,
           isActive: _languageCode == 'ar',
           onTap: () => _selectLanguage('ar'),
+        ),
+        _PresetChip(
+          chipKey: SettingsScreen.languageKey('fr'),
+          label: strings.languageFrench,
+          isActive: _languageCode == 'fr',
+          onTap: () => _selectLanguage('fr'),
         ),
       ],
     );

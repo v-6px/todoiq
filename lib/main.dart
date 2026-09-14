@@ -23,9 +23,23 @@ Future<void> main() async {
   // be loaded explicitly for anything but the default locale.
   await initializeDateFormatting();
 
-  // Load the time zone database and the alarm plugin. Permissions are asked
-  // for later, when the user first schedules a task.
-  await NotificationService.instance.init();
+  // The time zone database has to be loaded, and tz.local pointed at the
+  // device's zone, before anything builds a TZDateTime — otherwise every
+  // alarm is computed in UTC. Done here explicitly rather than trusted to the
+  // plugin setup below, which may fail on its own without taking this with it.
+  NotificationService.configureLocalTimeZone();
+
+  // The alarm plugin and its Android channel. Permissions are asked for on
+  // the home screen.
+  try {
+    await NotificationService.instance.init();
+  } catch (error, stack) {
+    // A broken plugin must not stop the app from opening; the tasks are still
+    // there, only the reminders are affected.
+    debugPrint('main: notification setup failed with '
+        '${error.runtimeType}: $error');
+    debugPrintStack(stackTrace: stack, label: 'main');
+  }
 
   runApp(const TaskMasterApp());
 }
@@ -46,7 +60,11 @@ class TaskMasterApp extends StatelessWidget {
           debugShowCheckedModeBanner: false,
           theme: AppTheme.forLocale(locale),
           locale: locale,
-          supportedLocales: const <Locale>[Locale('en'), Locale('ar')],
+          supportedLocales: const <Locale>[
+            Locale('en'),
+            Locale('ar'),
+            Locale('fr'),
+          ],
           // Supplies Material/Cupertino strings and, for Arabic, the
           // right-to-left text direction every screen inherits.
           localizationsDelegates: const <LocalizationsDelegate<Object>>[
