@@ -382,7 +382,7 @@ class _ReportScreenState extends State<ReportScreen>
               ),
               style: TextButton.styleFrom(
                 foregroundColor: AppColors.primary,
-                textStyle: AppText.buttonCap,
+                textStyle: AppTheme.localizedText(context, AppText.buttonCap),
                 padding: EdgeInsets.zero,
                 minimumSize: const Size(0, 36),
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,

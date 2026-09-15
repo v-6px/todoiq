@@ -138,6 +138,17 @@ class AppTheme {
   static String? fontFamilyForLocale(Locale locale) =>
       fontFamilyForLanguage(locale.languageCode);
 
+  /// [style] with the family for the locale in [context].
+  ///
+  /// For button `textStyle`s. A button paints its label with that style
+  /// alone, never merged with the theme's text styles, so a token that
+  /// leaves fontFamily null would skip Thmanyah and fall back to the
+  /// system's Arabic font.
+  static TextStyle localizedText(BuildContext context, TextStyle style) =>
+      style.copyWith(
+        fontFamily: fontFamilyForLocale(Localizations.localeOf(context)),
+      );
+
   /// The theme for [locale]. Arabic swaps in Thmanyah across every token.
   ///
   /// The typography tokens deliberately leave `fontFamily` null, so Flutter's
@@ -185,7 +196,9 @@ class AppTheme {
         style: FilledButton.styleFrom(
           backgroundColor: AppColors.primary,
           foregroundColor: AppColors.onPrimary,
-          textStyle: AppText.buttonMd,
+          // The button label is not merged with the theme's text styles,
+          // so the family has to be carried here explicitly.
+          textStyle: AppText.buttonMd.copyWith(fontFamily: fontFamily),
           padding: const EdgeInsets.symmetric(
             horizontal: AppSpacing.xl,
             vertical: AppSpacing.md,

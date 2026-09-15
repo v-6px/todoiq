@@ -8,10 +8,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
     <!-- Exact alarms so a task fires at its scheduled minute rather than being
-         batched by Doze. SCHEDULE_EXACT_ALARM covers API 31-32 (user-grantable);
-         USE_EXACT_ALARM covers API 33+ for an alarm-centric app. -->
+         batched by Doze. SCHEDULE_EXACT_ALARM is user-grantable; on Android 14+
+         it starts denied, which the home screen banner asks the user to grant,
+         and alarms fall back to inexact until then.
+         Do NOT add USE_EXACT_ALARM: Google Play restricts it to alarm clock
+         and calendar apps and rejected this app's release for declaring it. -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
 
     <!-- Re-register scheduled alarms after a device restart. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>

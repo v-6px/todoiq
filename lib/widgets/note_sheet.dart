@@ -160,7 +160,7 @@ class _NoteSheetState extends State<NoteSheet> {
                       onPressed: _skip,
                       style: OutlinedButton.styleFrom(
                         foregroundColor: AppColors.ink,
-                        textStyle: AppText.buttonMd,
+                        textStyle: AppTheme.localizedText(context, AppText.buttonMd),
                         side: const BorderSide(color: AppColors.hairlineDark),
                         padding: const EdgeInsets.symmetric(
                           horizontal: AppSpacing.xl,

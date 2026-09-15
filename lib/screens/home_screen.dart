@@ -864,7 +864,7 @@ class _DayNavigator extends StatelessWidget {
             onPressed: onToday,
             style: TextButton.styleFrom(
               foregroundColor: AppColors.primary,
-              textStyle: AppText.buttonCap,
+              textStyle: AppTheme.localizedText(context, AppText.buttonCap),
               padding: const EdgeInsets.symmetric(
                 horizontal: AppSpacing.md,
               ),
